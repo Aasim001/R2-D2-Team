@@ -1,0 +1,34 @@
+# --- secrets: the Wi-Fi + OTA password. NEVER commit. Copy firmware/robot_main/secrets.example.h -> secrets.h
+firmware/robot_main/secrets.h
+
+# --- firmware build output (the compiled binaries contain the Wi-Fi password as plain text)
+firmware/.build/
+firmware/.build-cam/
+firmware/*/build/
+build/
+*.bin
+*.elf
+*.map
+
+# --- recordings and camera pictures from runs (hundreds of MB)
+laptop/runs/
+laptop/tools/runs/
+laptop/camera_pictures/
+laptop/cam_focus_*.jpg
+laptop/auto_setup_check.jpg
+laptop/qr_*.jpg
+laptop/qr_*_raw.png
+laptop/tools/now.jpg
+
+# --- Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
