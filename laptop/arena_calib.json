@@ -1,0 +1,63 @@
+{
+  "camera": 0,
+  "frame_size": [
+    1920,
+    1080
+  ],
+  "arena_w": 3000.0,
+  "arena_h": 3000.0,
+  "corners_px": [
+    [
+      642.8108912772296,
+      200.5574888812926
+    ],
+    [
+      1432.325521420159,
+      184.31568452515543
+    ],
+    [
+      1808.4870486309574,
+      1060.796632325357
+    ],
+    [
+      331.29099625124917,
+      1007.5677319084917
+    ]
+  ],
+  "tape_ranges": [],
+  "focal_px": 1066.2,
+  "camera_mm": [
+    1519.6,
+    3601.3,
+    2327.7
+  ],
+  "official": true,
+  "calibrated_by": "red boundary lines (auto)",
+  "heading_offset_deg": -8.5,
+  "turn_sign": 1,
+  "turn_centre_mm": {
+    "left": [
+      1.4,
+      -6.7
+    ],
+    "right": [
+      11.5,
+      -4.9
+    ]
+  },
+  "heading_trim_deg": {
+    "E": -6.0,
+    "N": -6.6,
+    "W": -6.7,
+    "S": -5.8
+  },
+  "arm_deg": {
+    "stow": 30,
+    "carry": 58,
+    "release": 30,
+    "reach": 20
+  },
+  "arm_calibrated": true,
+  "enc_rad_per_mm": 0.010901,
+  "enc_turns_learnt": 49
+}

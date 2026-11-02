@@ -1,0 +1,21 @@
+# Wi-Fi + OTA passwords - never commit. Template: firmware/robot_main/secrets.example.h
+firmware/robot_main/secrets.h
+
+# firmware builds and full-flash backups contain those passwords in plain text
+firmware/.build/
+firmware/robot_main/build/
+firmware/backups/*
+!firmware/backups/README.txt
+
+# run recordings (hundreds of MB)
+laptop/runs/
+laptop/tools/runs/
+
+# camera snapshots
+laptop/auto_setup_check.jpg
+laptop/tools/now.jpg
+laptop/tools/frame_now.png
+
+# Python
+__pycache__/
+*.pyc
