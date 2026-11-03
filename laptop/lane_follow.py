@@ -520,7 +520,7 @@ def simulate(start, heading, goals, robot=(13.0, 14.5), seed=1, verbose=True, no
     lats = sorted(lats) or [0.0]
     return dict(worst=worst, worst_at=worst_at, fails=fails, worst_stop=worst_stop,
                 lat_rms=math.sqrt(sum(v * v for v in lats) / len(lats)), lat_p95=lats[int(0.95 * (len(lats) - 1))],
-                ko_frac=ko_steps / max(steps, 1))
+                ko_frac=ko_steps / max(steps, 1), time=t)
 
 
 if __name__ == "__main__":
