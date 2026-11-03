@@ -21,10 +21,12 @@ import math
 import arena_spec as spec
 
 # ---------------- tunables ----------------
-BASE_PWM    = 110         # straight-line speed (PWM 0-255). 110 (was 130): more time to correct - tools/tune_lane*.py
+BASE_PWM    = 160         # straight-line speed (PWM 0-255). 160 (was 110): fastest route in the simulator sweep
+                          # 2026-11-03 (10-stop route 143 s vs 257 s, no fails, stops <= 1.3 cm). Faster is SLOWER:
+                          # 200 weaves (2 % of the time in keep-out), 255 overshoots and fails legs
 MIN_PWM     = 95          # N20s stall below this - also the speed for nudges
-PIVOT_PWM   = 160         # turning on the spot, far from the target heading. 160 (was 120): bot 1 turned only ~20 deg/s
-                          # at 150 (H test 2026-10-30), though it drives straight normally
+PIVOT_PWM   = 220         # turning on the spot, far from the target heading. 220 (was 160; bot 1 turned only ~20 deg/s
+                          # at 150 in the H test 2026-10-30). The small final turns still use PIVOT_MIN_PWM pulses
 PIVOT_MIN_PWM = 130       # small turns (timed pulses) start at this (was MIN_PWM 95: bot 1 hardly turns below ~130);
                           # raised automatically if the pulses still don't turn it
 ALIGN_DEG   = 5           # a turn is done within this
