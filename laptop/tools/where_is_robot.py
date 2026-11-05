@@ -5,7 +5,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))           # laptop/
 import arena_drive as ad          # (sets the camera env var before cv2)
 import cv2, numpy as np
-calib = json.load(open(ad.CALIB_FILE)); arena = ad.Arena(calib)
+calib = ad.load_calib(); arena = ad.Arena(calib)
 cap = ad.open_camera(calib.get("camera", 0))
 if cap is None: print("camera not available"); sys.exit(1)
 poses, prev, shift = [], None, None

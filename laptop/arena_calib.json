@@ -8,56 +8,91 @@
   "arena_h": 3000.0,
   "corners_px": [
     [
-      642.8108912772296,
-      200.5574888812926
+      649.7310945051639,
+      215.7159604801117
     ],
     [
-      1432.325521420159,
-      184.31568452515543
+      1435.4882976468875,
+      210.6777634518951
     ],
     [
-      1808.4870486309574,
-      1060.796632325357
+      1807.674392350175,
+      1094.0096255418564
     ],
     [
-      331.29099625124917,
-      1007.5677319084917
+      321.8990103431847,
+      1018.4781017992455
     ]
   ],
   "tape_ranges": [],
   "focal_px": 1066.2,
   "camera_mm": [
-    1519.6,
-    3601.3,
-    2327.7
+    1520.6,
+    3600.7,
+    2332.1
   ],
   "official": true,
   "calibrated_by": "red boundary lines (auto)",
-  "heading_offset_deg": -8.5,
-  "turn_sign": 1,
-  "turn_centre_mm": {
-    "left": [
-      1.4,
-      -6.7
-    ],
-    "right": [
-      11.5,
-      -4.9
-    ]
+  "arm_deg_by_tag": {
+    "11": {
+      "stow": 30,
+      "carry": 58,
+      "release": 30,
+      "reach": 20
+    },
+    "10": {
+      "stow": 30,
+      "carry": 47,
+      "release": 8,
+      "reach": 8
+    }
   },
-  "heading_trim_deg": {
-    "E": -6.0,
-    "N": -6.6,
-    "W": -6.7,
-    "S": -5.8
-  },
-  "arm_deg": {
-    "stow": 30,
-    "carry": 58,
-    "release": 30,
-    "reach": 20
-  },
-  "arm_calibrated": true,
-  "enc_rad_per_mm": 0.010901,
-  "enc_turns_learnt": 49
+  "robots": {
+    "11": {
+      "heading_offset_deg": -9.5,
+      "turn_sign": 1,
+      "turn_centre_mm": {
+        "left": [
+          -3.4,
+          -6.8
+        ],
+        "right": [
+          -2.8,
+          -5.3
+        ]
+      },
+      "heading_trim_deg": {
+        "E": -6.1,
+        "N": -8.5,
+        "W": -8.6,
+        "S": -8.2
+      },
+      "enc_rad_per_mm": 0.01093,
+      "enc_turns_learnt": 114
+    },
+    "10": {
+      "heading_offset_deg": -6.7,
+      "turn_sign": 1,
+      "turn_centre_mm": {
+        "left": [
+          -13.4,
+          14.9
+        ],
+        "right": [
+          -10.9,
+          16.2
+        ]
+      },
+      "heading_trim_deg": {
+        "E": -7.3,
+        "N": -7.5,
+        "W": -7.3,
+        "S": -8.0
+      },
+      "enc_rad_per_mm": 0.004363,
+      "enc_turns_learnt": 104,
+      "claw_hold_mm": 121,
+      "claw_side_mm": -18
+    }
+  }
 }

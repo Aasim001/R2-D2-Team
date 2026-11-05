@@ -53,8 +53,12 @@ Motors (each has 6 wires: white M1, red M2, black VCC, blue GND, green C1, yello
   (D2 also drives the board's blue LED on many DevKits - it will glow/flicker; harmless.)
 - The 3.3 V signal from the ESP32 is fine for the MG90S - no level shifter needed.
 - At power-on the servo gets no signal (limp, it does not move). It starts with the first servo / arm command.
-- Claw angles (measured 2026-10-30): a higher angle closes it; 58 deg grips the cube, 30 deg = open. The
-  firmware holds every servo command to 30-60 deg (`ARM_MIN` / `ARM_MAX` in robot_main.ino).
+- Claw angles - a higher angle closes it, but each robot's claw sits differently on its servo, so the angles are
+  per robot (`arm_deg_by_tag` in laptop/arena_calib.json, by marker id):
+  - bot 1 (marker 11, 2026-10-30): grip 58, open 30, wide open 20
+  - bot 2 (marker 10, 2026-11-03): grip 44, open 30, wide open 20 - its jaws already TOUCH at 51 (no cube), so
+    bot 1's 58 would jam it
+  The firmware holds every servo command to 20-60 deg (`ARM_MIN` / `ARM_MAX` in robot_main.ino).
 - Not sure where the servo is? `nudge <deg> [pulses]` sends only a few pulses, so it moves just a little.
 - Fitting the claw: power the robot, send `arm stow` (the servo goes to 30 deg = open), THEN press the claw
   onto the spline in its open position. Then check / calibrate:

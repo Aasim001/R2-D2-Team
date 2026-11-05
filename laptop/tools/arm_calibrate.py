@@ -1,8 +1,9 @@
-"""Calibrate the pickup claw (one MG90S on D2) and save the angles in arena_calib.json. Nothing else moves -
-only the servo. The firmware holds every angle to its safe range (ARM_MIN..ARM_MAX in robot_main.ino, now 30-60).
-Measured 2026-10-30: a higher angle closes the claw; carry (grip) 58, open 30.
+"""Calibrate the pickup claw (one MG90S on D2) and save the angles in arena_calib.json, for ONE robot (its marker id:
+each claw sits differently on its servo). Nothing else moves - only the servo. The firmware holds every angle to its
+safe range (ARM_MIN..ARM_MAX in robot_main.ino, now 20-60). A higher angle closes the claw.
+Measured: bot 1 (marker 11) grip 58, open 30; bot 2 (marker 10, 2026-11-03) grip 44, open 30, jaws touch at 51.
 
-usage:  python tools/arm_calibrate.py [ROBOT_IP]
+usage:  python tools/arm_calibrate.py ROBOT_IP [MARKER_ID]      (MARKER_ID: default arena_drive.ROBOT_TAG_ID)
 
 Type a command and press Enter:
   40          go to 40 degrees            +5 / -2     nudge from where it is
@@ -23,6 +24,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 import arena_drive as ad
 
 ip = sys.argv[1] if len(sys.argv) > 1 else "192.168.43.93"
+tag = str(int(sys.argv[2])) if len(sys.argv) > 2 else str(ad.ROBOT_TAG_ID)
 addr = (ip, ad.CAR_PORT)
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.settimeout(1.0)
@@ -52,15 +54,16 @@ def go(deg):
 
 
 calib = json.load(open(ad.CALIB_FILE))
-deg = dict(calib.get("arm_deg", ad.ARM_DEFAULT))
+saved = calib.get("arm_deg_by_tag", {}).get(tag)
+deg = dict(saved or ad.ARM_DEFAULT)
 st = status()
 if st is None:
     print(f"No answer from the robot at {ip} - is it on and on the Wi-Fi?")
     sys.exit(1)
 now = st["servo"]
 print(__doc__.split("Type a command")[0].strip())
-print(f"\nRobot found. Servo now at {now} deg. Saved angles: {deg}"
-      f"{'' if calib.get('arm_calibrated') else '  (NOT calibrated yet - these are CAD guesses)'}")
+print(f"\nRobot found (marker {tag}). Servo now at {now} deg. Saved angles: {deg}"
+      f"{'' if saved else '  (NOT calibrated yet for this robot - these are bot 1 values)'}")
 print("Commands: <deg>  +N  -N  stow  reach  carry  release  test  show  done  q")
 while True:
     try:
@@ -90,9 +93,9 @@ while True:
                   f"(now {deg}). Check them, then 'done' again.")
             continue
         calib = json.load(open(ad.CALIB_FILE))      # (re-read: the main program may have saved since)
-        calib["arm_deg"], calib["arm_calibrated"] = deg, True
+        calib.setdefault("arm_deg_by_tag", {})[tag] = deg
         ad.save_calib(calib)
-        print(f"  Saved in {os.path.basename(ad.CALIB_FILE)}: {deg} - the arm is calibrated.")
+        print(f"  Saved in {os.path.basename(ad.CALIB_FILE)} for marker {tag}: {deg} - this robot's claw is calibrated.")
         break
     else:
         try:

@@ -37,6 +37,7 @@ import argparse, json, math, os, socket, struct, sys, threading, time
 # Windows Media Foundation: with its "hardware transforms" on, opening this webcam hangs for minutes;
 # off, it opens in under a second and runs at 30 fps. Must be set before OpenCV is loaded.
 os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
+import glob
 import cv2
 import numpy as np
 import arena_spec as spec                  # the official competition floor
@@ -152,6 +153,8 @@ class Camera:                               # always holds the newest frame (no 
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
+        if isinstance(self.src, str) and self.src.startswith("shm:"):
+            return self._run_shm(self.src[4:])
         while self.running:
             cap = open_camera(self.src)
             if cap is None:
@@ -170,6 +173,36 @@ class Camera:                               # always holds the newest frame (no 
                     time.sleep(0.03)
             cap.release()
             self.status = "camera dropped - reconnecting"
+
+    def _run_shm(self, name):
+        """--camera shm:NAME = frames from tools/cam_relay.py (one process owns the webcam, several robots' runs read
+        it). Layout: uint64 seq (odd while the relay writes), float64 time, uint32 width, height, then the BGR frame."""
+        from multiprocessing import shared_memory
+        shm, last = None, None
+        while self.running:
+            if shm is None:
+                try:
+                    shm = shared_memory.SharedMemory(name=name)
+                except FileNotFoundError:
+                    self.status = f"no camera relay '{name}' - start tools/cam_relay.py"
+                    time.sleep(0.5)
+                    continue
+                seq = np.ndarray((1,), np.uint64, shm.buf, 0)
+                ts = np.ndarray((1,), np.float64, shm.buf, 8)
+                w, h = (int(v) for v in np.ndarray((2,), np.uint32, shm.buf, 16))
+                img = np.ndarray((h, w, 3), np.uint8, shm.buf, 32)
+            s1 = int(seq[0])
+            if s1 == last or s1 % 2:
+                if time.time() - float(ts[0]) > 2.0:
+                    self.status = "camera relay stalled"
+                time.sleep(0.003)
+                continue
+            f, t = img.copy(), float(ts[0])
+            if int(seq[0]) != s1:                         # written meanwhile: take the next one
+                continue
+            last, self.status = s1, "ok"
+            with self.lock:
+                self.frame, self.t = f, t
 
     def latest(self):
         with self.lock:
@@ -481,10 +514,25 @@ def red_boundary_corners(frame):
       1. rough corners = extreme ends of LONG straight red lines (small red things don't count)
       2. along each side: the reddest pixel across the line at 200 points (works where the tape is
          faint, far away, or partly hidden by people) -> robust (RANSAC) straight-line fit
-      3. corners = where the 4 fitted lines meet"""
+      3. corners = where the 4 fitted lines meet
+    The far side can be pale (2026-11-03 afternoon: the north tape read redness 16-29 against 48 for the near one), so
+    step 1 is tried at a lower redness when a side isn't found properly."""
     I = frame.astype(np.int32)
     redness = cv2.GaussianBlur((I[:, :, 2] - np.maximum(I[:, :, 1], I[:, :, 0])).astype(np.float32), (3, 3), 0)
-    segs = cv2.HoughLinesP((redness >= 25).astype(np.uint8) * 255, 1, np.pi / 360, threshold=60,
+    why = ""
+    for thr in RED_LINE_THRESHOLDS:
+        corners, why = _red_boundary(frame, redness, thr)
+        if corners is not None:
+            return corners, why + (f" (red lines found at redness >= {thr})" if thr != RED_LINE_THRESHOLDS[0] else "")
+    return None, why
+
+
+RED_LINE_THRESHOLDS = (25, 18, 12)   # redness for the long red lines (step 1), tried in this order
+RED_SIDE_MIN_POINTS = 40             # a side fitted through fewer of its 200 points is not trusted
+
+
+def _red_boundary(frame, redness, thr):
+    segs = cv2.HoughLinesP((redness >= thr).astype(np.uint8) * 255, 1, np.pi / 360, threshold=60,
                            minLineLength=120, maxLineGap=25)
     if segs is None or len(segs) < 4:
         return None, "no long red lines found - is the red boundary in view?"
@@ -522,6 +570,8 @@ def red_boundary_corners(frame):
         nrm = np.column_stack([-d[ok, 1], d[ok, 0]]) / n[ok, None]   # normal of each candidate line
         dist = np.abs(pts @ nrm.T - (pts[i[ok]] * nrm).sum(axis=1))  # (points, candidates)
         best = dist[:, int(np.argmax((dist < 2.5).sum(axis=0)))] < 2.5
+        if best.sum() < RED_SIDE_MIN_POINTS:
+            return None, f"too little red found along the {side} side ({int(best.sum())} points on a line)"
         vx, vy, x0, y0 = cv2.fitLine(pts[best], cv2.DIST_L2, 0, 0.01, 0.01).ravel()
         lines[side] = (np.array([x0, y0], float), np.array([vx, vy], float))
         report.append(f"{side}: {int(best.sum())}/{len(pts)} points")
@@ -623,14 +673,16 @@ def auto_setup(cam, src):
               " edge points) - something on the boundary or the floor? Not used.")
         return None
     focal, cam_mm = camera_pose(corners, float(ARENA_MM), float(ARENA_MM), (w, h))
-    old = json.load(open(CALIB_FILE)) if os.path.exists(CALIB_FILE) else {}
+    old = load_calib() or {}
+    if isinstance(src, str) and src.startswith("shm:"):  # (a relay runs only now: remember the real webcam)
+        src = old.get("camera", CAMERA)
     calib = dict(camera=src, frame_size=[w, h], arena_w=float(ARENA_MM), arena_h=float(ARENA_MM),
                  corners_px=corners, tape_ranges=[], focal_px=round(focal, 1),
                  camera_mm=[round(c, 1) for c in cam_mm], official=True, calibrated_by="red boundary lines (auto)",
                  heading_offset_deg=old.get("heading_offset_deg"), turn_sign=old.get("turn_sign", 1),
                  turn_centre_mm=old.get("turn_centre_mm", [0.0, 0.0]),
                  heading_trim_deg=old.get("heading_trim_deg", {}))
-    for key in ("arm_deg", "arm_calibrated", "enc_rad_per_mm", "enc_turns_learnt"):   # (they belong to the robot)
+    for key in ("arm_deg_by_tag", "robots", "enc_rad_per_mm", "enc_turns_learnt"):   # (they belong to the robots)
         if key in old:
             calib[key] = old[key]
     moved = ""
@@ -734,17 +786,18 @@ def find_robot_color(frame, arena, hint=None, prev_heading=None):
     return centre, wrap(dirs[a]), px, wrap(dirs[shape])   # (last: what the shape alone says, for run()'s check)
 
 
-def find_robot(frame, detector, arena, hint=None, prev_heading=None):
+def find_robot(frame, detector, arena, hint=None, prev_heading=None, try_2x=True):
     """(centre mm, mark direction rad, mark outline px, direction from this frame alone) or None.
     ROBOT_MARK picks how.
     hint = the mark's outline/corners (px) from a recent frame, prev_heading = its direction then.
     hint = marker corners from a recent frame: look there first (small crop, enlarged to ~80 px),
-    then in the whole arena as it is, then the whole arena enlarged 2x (a small marker can be
-    missed at one size and found at another, so it tries more than one)."""
+    then in the whole arena as it is, then (if try_2x) the whole arena enlarged 2x (a small marker can be
+    missed at one size and found at another, so it tries more than one). Times at 1080p: hint 4 ms,
+    whole arena 13 ms, enlarged 2x another 37 ms - so the run loop asks for 2x only every few frames."""
     if ROBOT_MARK == "color":
         return find_robot_color(frame, arena, hint, prev_heading)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    tries = [(arena.search_box, 1), (arena.search_box, 2)]
+    tries = [(arena.search_box, 1)] + ([(arena.search_box, 2)] if try_2x else [])
     if hint is not None:
         (x0, y0), (x1, y1) = (hint.min(0) - 60).astype(int), (hint.max(0) + 60).astype(int)
         side = max(np.ptp(hint[:, 0]), np.ptp(hint[:, 1]), 1)
@@ -1111,9 +1164,37 @@ def _colour_range(v):
     return [[[h0, s_lo, v_lo], [h1, 255, 255]] for h0, h1 in hues]
 
 
+ROBOT_KEYS = ("heading_offset_deg", "turn_sign", "turn_centre_mm", "heading_trim_deg", "enc_rad_per_mm", "enc_turns_learnt",
+              "claw_hold_mm", "claw_side_mm")
+# ^ what belongs to ONE robot and its marker (H test, SYNC, learnt while driving): kept per robot in arena_calib.json
+#   under "robots" -> marker id, so driving bot 2 doesn't overwrite what was learnt about bot 1
+
+
+def load_calib():
+    """arena_calib.json (None if there is none) with the driven robot's own values (robots[ROBOT_TAG_ID]) at the top
+    level, where the rest of the code reads them. A robot not in the file yet has none (= not calibrated)."""
+    if not os.path.exists(CALIB_FILE):
+        return None
+    with open(CALIB_FILE) as f:
+        calib = json.load(f)
+    calib.update(calib.get("robots", {}).get(str(ROBOT_TAG_ID), {}))
+    return calib
+
+
 def save_calib(calib):
+    """The arena part as it is; this robot's values (ROBOT_KEYS) under robots[ROBOT_TAG_ID]; other robots' are kept."""
+    out = {k: v for k, v in calib.items() if k not in ROBOT_KEYS}
+    robots = dict(out.get("robots", {}))
+    if os.path.exists(CALIB_FILE):                         # another robot's run may have saved since this one started
+        try:
+            with open(CALIB_FILE) as f:
+                robots.update({k: v for k, v in json.load(f).get("robots", {}).items() if k != str(ROBOT_TAG_ID)})
+        except (OSError, ValueError):
+            pass
+    robots[str(ROBOT_TAG_ID)] = {**robots.get(str(ROBOT_TAG_ID), {}), **{k: calib[k] for k in ROBOT_KEYS if k in calib}}
+    out["robots"] = robots
     with open(CALIB_FILE, "w") as f:
-        json.dump(calib, f, indent=2)
+        json.dump(out, f, indent=2)
 
 
 def screen_size():
@@ -1244,6 +1325,8 @@ def setup(cam, src, arena_w, arena_h):
                  tape_ranges=ranges, focal_px=round(focal, 1), camera_mm=[round(c, 1) for c in cam_mm],
                  heading_offset_deg=None, turn_sign=1, official=OFFICIAL,
                  calibrated_by="floor markers" if step == 0 else "clicks")
+    old = load_calib() or {}
+    calib.update({k: old[k] for k in ("robots", "arm_deg_by_tag") if k in old})   # (the other robots' and the claws')
     arena = Arena(calib, load_map=False)
 
     acc, n, last, t_start = np.zeros((arena.size[1], arena.size[0]), np.float32), 0, 0.0, time.time()
@@ -1432,8 +1515,7 @@ def draw(frame, top, tape, arena, tag_px, pose, plan, state, base, cmd, fps, run
     if not running:
         cv2.rectangle(cam, (0, 0), (cam.shape[1] - 1, cam.shape[0] - 1), (0, 0, 255), 3)
 
-    m = (top * 0.45).astype(np.uint8)
-    m[tape > 0] = (0, 0, 255)
+    m = cv2.copyTo(np.full_like(top, (0, 0, 255)), tape, cv2.convertScaleAbs(top, alpha=0.45))   # (numpy: 6 ms, this 0.5)
     sc = VIEW_H / m.shape[0]
     m = cv2.resize(m, None, fx=sc, fy=sc, interpolation=cv2.INTER_NEAREST)
     k = sc / MM_PER_PX                                     # mm -> window pixels
@@ -1460,7 +1542,8 @@ class Recorder:
     laptop/runs/arena-<date-time>/  log.csv (every frame), frames/*.jpg (3 per second + every
     state change), summary.txt"""
     def __init__(self):
-        self.dir = os.path.join(HERE, "runs", "arena-" + time.strftime("%Y%m%d-%H%M%S"))
+        self.dir = os.path.join(HERE, "runs", "arena-" + time.strftime("%Y%m%d-%H%M%S")
+                                + f"-m{ROBOT_TAG_ID}")       # (two robots' runs can start in the same second)
         os.makedirs(os.path.join(self.dir, "frames"))
         self.csv = open(os.path.join(self.dir, "log.csv"), "w")
         self.csv.write("t,fps,state,base,x_mm,y_mm,heading_deg,target_deg,free_mm,clear_mm,L,R,"
@@ -1692,13 +1775,16 @@ ACQUIRE_FRAMES = 3            # finding the robot afresh: this many frames in a 
 # (The first design, cad/pickup_bot_v2.scad, was a side scissor arm with a one-way flap.)
 #   PICK : reach (open) -> carry (the claw closes on the cube and holds it)
 #   DROP : release (open) -> the cube is let go; once the robot is out of the bay the claw stows.
-ARM_DEFAULT = {"stow": 30, "carry": 58, "release": 30, "reach": 20}
+ARM_DEFAULT = {"stow": 30, "carry": 58, "release": 30, "reach": 20}   # (bot 1's; tools/arm_calibrate.py starts here)
 # ^ servo degrees, measured on the robot 2026-10-30: a HIGHER angle CLOSES the claw, 58 grips the cube, 30 =
 #   open; reach (open for the approach) 20 - camera test 2026-11-02: the jaw tips spread further than at 30, no end
 #   stop. The firmware holds every servo command to 20-60 (ARM_MIN / ARM_MAX in robot_main.ino): past 60 the claw
 #   would squeeze / jam and the stalled servo can brown out the ESP32. The claw won't move until arena_calib.json
-#   has arm_calibrated (tools/arm_calibrate.py sets arm_deg + arm_calibrated).
+#   has this robot's angles (arm_deg_by_tag, see arm_angles(); tools/arm_calibrate.py saves them).
 ARM_DEG_PER_S = 125           # how fast the firmware moves the servo (1 deg / 8 ms)
+ARM_DEG_PER_S_SLOW = 20       # ... but bot 1's old firmware stepped 1 deg per loop pass: 25 deg/s measured 2026-11-04 (the
+                              # pick waited for 125, crept on with the claw half open and closed it while backing out)
+ARM_SETTLE_S = 0.2            # once the robot reports the angle, the servo horn itself still needs a moment
 PICK_STEPS = [("reach", 0.4), ("carry", 0.6)]   # (pose, then wait this long: claw opens / closes on the cube)
 DROP_STEPS = [("release", 0.4)]
 CUBE_MM = 50                  # the package cube (handout: 4-5 cm)
@@ -1711,10 +1797,17 @@ CREEP_STOP_EARLY_MM = 25      # the robot coasts about this far after the stop c
 CREEP_TIMEOUT_S = 4.0         # a creep that hasn't got there by then ends anyway (stuck on the cube?)
 
 
+def arm_angles(calib):
+    """Claw angles of the robot being driven (arena_calib.json "arm_deg_by_tag", keyed by its marker id ROBOT_TAG_ID),
+    or None if its claw hasn't been calibrated. Per robot, because each claw sits differently on its servo: bot 1
+    (id 11) grips at 58, bot 2 (id 10, measured 2026-11-03) grips at 44 and its jaws already touch at 51."""
+    return calib.get("arm_deg_by_tag", {}).get(str(ROBOT_TAG_ID))
+
+
 def arm_task(kind, calib, creep_mm=None):
     """kind 'pick' or 'drop' -> a task for arm_step(). Steps: ("servo", deg, wait) / ("creep", mm, wait).
     creep_mm = how far to creep toward the cube with the claw open (None = PICK_CREEP_MM)."""
-    deg = calib.get("arm_deg", ARM_DEFAULT)
+    deg = arm_angles(calib)
     steps = [("servo", deg[name], wait) for name, wait in (PICK_STEPS if kind == "pick" else DROP_STEPS)]
     if kind == "pick":
         creep = PICK_CREEP_MM if creep_mm is None else int(creep_mm)
@@ -1752,10 +1845,11 @@ def arm_step(task, car, now, pose=None):
                 task["until"] = now + wait
                 return False, (0, 0)
             prev = task.get("prev", target)
-            need = abs(target - prev) / ARM_DEG_PER_S
             there = car.fresh(1.0) and car.servo is not None and abs(car.servo - target) <= 1
-            if there or now - task["t"] > need + 0.5:
-                task["until"] = now + wait
+            if there:                                      # the robot says the claw is there: let the servo settle
+                task["until"] = now + wait + ARM_SETTLE_S
+            elif now - task["t"] > abs(target - prev) / ARM_DEG_PER_S_SLOW + 0.5:   # no word from the robot:
+                task["until"] = now + wait                 # allow for the slowest servo seen
             return False, (0, 0)
         if now < task["until"]:
             return False, (0, 0)
@@ -1777,10 +1871,11 @@ def cube_corners(pos, heading):
     left = np.array([math.sin(heading), -math.cos(heading)])            # (map y points down)
     p = np.asarray(pos, float)
     h = CUBE_MM / 2
-    if lane_follow.PICK_SIDE == "front":
-        near, far = ROBOT_LEN_MM / 2, ROBOT_LEN_MM / 2 + CUBE_MM
-        return np.array([p + fwd * near + left * h, p + fwd * far + left * h, p + fwd * far - left * h,
-                         p + fwd * near - left * h])
+    if lane_follow.PICK_SIDE == "front":                                 # held CLAW_HOLD_MM ahead, CLAW_SIDE_MM left
+        c = p + left * CLAW_SIDE_MM
+        near, far = CLAW_HOLD_MM - h, CLAW_HOLD_MM + h
+        return np.array([c + fwd * near + left * h, c + fwd * far + left * h, c + fwd * far - left * h,
+                         c + fwd * near - left * h])
     side = -left if lane_follow.PICK_SIDE == "right" else left
     near, far = ROBOT_WID_MM / 2, ROBOT_WID_MM / 2 + CUBE_MM
     return np.array([p + side * near + fwd * h, p + side * far + fwd * h, p + side * far - fwd * h,
@@ -1794,19 +1889,53 @@ def cube_corners(pos, heading):
 CLAW_HOLD_MM = 100            # the claw holds a cube with its centre this far in front of the turning point (bot 1, measured
                               # from the camera 2026-11-02: jaws from ~60 to ~130 mm in front of it)
 CLAW_TIP_MM = 130             # ... and its jaw tips reach this far
+CLAW_SIDE_MM = 0              # ... and the held cube's centre is this far to the LEFT of the turning point
+# ^ bot 1's. Per robot they come from arena_calib.json robots[marker] "claw_hold_mm" / "claw_side_mm" (set in main()):
+#   bot 2's turning point is ~3 cm to the side of its marker, so lining the turning point up with the cube missed it
 CREEP_MAX_MM = 110            # never creep further than this toward a cube
 CUBE_ROI_MM = 30              # look this far around the alcove (back + sides): a pushed cube can stick out of it
-CUBE_BRIGHT_V = 35            # a pixel this much brighter than the floor (HSV value) can be part of the cube: it is white
+CUBE_BRIGHT_FRAC, CUBE_BRIGHT_MIN = 0.2, 22   # 2026-11-03 evening: a fixed 35 missed both cubes on a darker floor (V 131);
+                              # now 20 % of the floor's brightness (~30 in daylight)
+CUBE_BRIGHT_V = 35            # (claw_measure.py) a pixel this much brighter than the floor (HSV value) can be part of the cube: it is white
+                              # (30 tried 2026-11-03: found a cube on the alcove's back-wall tape more often, 9 of 10 frames vs 7,
+                              # but put the e2e cube 2.4 cm too far -> creep 100 mm, body 5 cm into the alcove)
                               # (~200+ against ~140), while the tape, the robot and its claw are dark - so tape laid a bit
                               # off the plan can't be taken for a cube (it was, by a darker-or-brighter test)
 CUBE_MIN_PX = 600             # px (1 px = 1 mm2): fewer = a speck, not a cube (its top alone is 2500)
+CUBE_HALF_PX = 250            # a cube cut in two by a tape line: two pieces of at least this many px ...
+CUBE_SPLIT_GAP_MM = 25        # ... at most this far apart, cube-sized together (closing 25 mm gaps everywhere invented
+                              # cubes from glare and tape edges in empty-arena pictures)
 CUBE_SIZE_MM = (20, 120)      # the bright patch's width / length must be in this range (top face + the side face seen
                               # from the camera's slant) - glare off the shiny floor is usually a long stripe
 PICK_TRIES = 2                # a pick that leaves the cube in the alcove is tried again (once) from a fresh look
+PICK_VERIFY_CM = 35           # right after a pick the robot hides its own alcove from the camera (2026-11-03: "no cube
+                              # left" while it was there): once the robot is this far away, look again - cube still there
+PICK_REDO = 2                 # = PICK FAILED: stop, go back and pick again, at most this many times (--auto)
+PICK_VERIFY_AROUND_MM = 100   # ... looking for the cube this far around the alcove (2026-11-03: a miss pushed it onto the
+                              # block's tape at the alcove's corner, outside the alcove check -> a false "confirmed")
+CREEP_TRIM_MAX_MM = 30        # a failed pick that pushed the cube: the next creep there is shorter by the push (at most this)
+PUSH_MAX_MM = 60              # ... a push is a cube moved 1-6 cm deeper into the alcove; further = dropped / moved by hand
+PICK_ALIGN_CM = 1.0           # cube more than this to the side of the claw's line: turn to face it before creeping in,
+PICK_ALIGN_MAX_DEG = 25       # ... but never more than this (a bigger turn = a bad cube reading: 2026-11-03 one gave 54 deg)
+PICK_ALIGN_DEG = 2            # ... to within this (a normal turn stops within lane_follow.ALIGN_DEG = 5: 1.6 cm at 18 cm)
 DOCK_SHIFT_MAX_CM = 7         # stop up to this far along the docking square (20 cm long) to line up with the cube
 
 
-def find_cube(frame, arena, station, pose=None):
+CUBE_AT_FILL = 0.8            # cube_at: a 2 x 2 cm square at least this bright = a cube (its bright part is only
+                              # ~2-2.5 cm wide in the top-down picture: measured on the 2026-11-04 DZ frame)
+
+
+def cube_at(frame, arena, xy, pose=None, search_cm=None):
+    """Is there a cube whose top lies within search_cm of xy (official cm)? True / False / None (can't see there).
+    Unlike find_cube it needs no separate cube-sized patch: two cubes touching in DZ merge into one bright patch
+    (2026-11-04: bot 1's drop "failed" twice next to bot 2's cube - both cubes were there)."""
+    search_cm = DROP_VERIFY_CM if search_cm is None else search_cm
+    m = search_cm + 6
+    return find_cube(frame, arena, "DZ", pose, rect=(xy[0] - m, xy[1] - m, xy[0] + m, xy[1] + m),
+                     fill_at=(xy[0], xy[1], search_cm))
+
+
+def find_cube(frame, arena, station, pose=None, around_mm=None, rect=None, fill_at=None):
     """The cube in a station's alcove (or in a bay: station = "DZ", "P1".."P3") from the overhead camera: its
     centre (official x cm, y cm), or None.
     The alcove (+ CUBE_ROI_MM around its back and sides) is warped to a top-down picture at the cube's TOP height
@@ -1814,10 +1943,18 @@ def find_cube(frame, arena, station, pose=None):
     The cube is white: only what is clearly brighter than the floor counts (not the black tape, nor the dark robot
     and claw); the robot is also left out by its outline (pose = its (map mm, heading), body + claw, from the floor
     to its top - its marker has a white border). The biggest cube-sized bright patch is the cube; its centre = half
-    a cube in from its FAR edge as seen from the camera (the side faces only add to the near side)."""
+    a cube in from its FAR edge as seen from the camera (the side faces only add to the near side).
+    around_mm: look this far around the alcove / bay on ALL sides instead (the docking square too): is there a cube
+    anywhere near the station - e.g. one a missed pick pushed out of the alcove."""
     if not OFFICIAL:
         return None
-    if station in spec.BAYS:                               # a bay: just its own rectangle
+    if rect is not None:                                   # rect = (x0, y0, x1, y1) official cm: look only there
+        X0, Y0, X1, Y1 = rect
+    elif around_mm is not None:
+        x0, y0, x1, y1 = spec.BAYS[station]["rect"] if station in spec.BAYS else spec.alcove_rect(station)
+        m = around_mm / 10
+        X0, Y0, X1, Y1 = x0 - m, y0 - m, x1 + m, y1 + m
+    elif station in spec.BAYS:                             # a bay: just its own rectangle
         if not spec.CUTOUTS:
             return None
         X0, Y0, X1, Y1 = spec.BAYS[station]["rect"]
@@ -1844,10 +1981,11 @@ def find_cube(frame, arena, station, pose=None):
     seen = cv2.warpPerspective(np.full(frame.shape[:2], 255, np.uint8), Hinv, (W, Hh), flags=cv2.INTER_NEAREST,
                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     mask = seen == 0                                       # (outside the picture)
-    if pose is not None:                                   # the robot (body + claw), from the floor to its top
-        (px, py), h = pose
+    robots = ([(pose, CLAW_TIP_MM)] if pose is not None else []) + [(o, max(CLAW_TIP_MM, 160)) for o in OTHER_POSES]
+    for pose_, tip in robots:                              # each robot (body + claw), from the floor to its top
+        (px, py), h = pose_
         fwd, lft = np.array([math.cos(h), math.sin(h)]), np.array([math.sin(h), -math.cos(h)])
-        foot = [np.array([px, py]) + fwd * a + lft * b for a in (-(ROBOT_LEN_MM / 2 + 25), CLAW_TIP_MM + 15)
+        foot = [np.array([px, py]) + fwd * a + lft * b for a in (-(ROBOT_LEN_MM / 2 + 25), tip + 15)
                 for b in (-(ROBOT_WID_MM / 2 + 25), ROBOT_WID_MM / 2 + 25)]
         cam_xy, pts = np.array([cx, cy]), []
         for z in (-ROBOT_TOP_MM / 2, 0.0, float(ROBOT_TOP_MM)):   # height z shows up scaled k / k(z) about the camera
@@ -1861,20 +1999,41 @@ def find_cube(frame, arena, station, pose=None):
         return None
     V = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)[..., 2].astype(np.int16)
     floor_v = np.median(V[~mask])
-    cand = ((V - floor_v > CUBE_BRIGHT_V) & ~mask).astype(np.uint8)
+    cand = ((V - floor_v > max(CUBE_BRIGHT_MIN, CUBE_BRIGHT_FRAC * floor_v)) & ~mask).astype(np.uint8)
     cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))  # (fills the QR's black squares)
     cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
     cand[mask] = 0
+    if fill_at is not None:                                # cube_at(): any cube-top-sized bright square near there?
+        fx, fy, r_ = fill_at
+        box = cv2.blur(cand.astype(np.float32), (20, 20))  # fraction of each 2 x 2 cm square that is bright
+        vis = cv2.blur((~mask).astype(np.float32), (20, 20))
+        ys, xs = np.ogrid[:Hh, :W]
+        near = ((xs - (fx - X0) * 10) ** 2 + (ys - (Y1 - fy) * 10) ** 2 <= (r_ * 10) ** 2) & (vis > 0.9)
+        if not near.any():
+            return None                                    # (hidden there: robot / outside the picture)
+        return bool((box[near] >= CUBE_AT_FILL).any())
     n, lab, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
-    best = None
+    cube_sized = lambda w_, h_: CUBE_SIZE_MM[0] <= min(w_, h_) and max(w_, h_) <= CUBE_SIZE_MM[1]
+    best, area = None, 0
     for i in range(1, n):                                  # the biggest cube-sized bright patch
         w_, h_, a_ = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT], stats[i, cv2.CC_STAT_AREA]
-        if (a_ >= CUBE_MIN_PX and CUBE_SIZE_MM[0] <= min(w_, h_) and max(w_, h_) <= CUBE_SIZE_MM[1]
-                and (best is None or a_ > stats[best, cv2.CC_STAT_AREA])):
-            best = i
+        if a_ >= CUBE_MIN_PX and cube_sized(w_, h_) and a_ > area:
+            best, area = [i], a_
+    if best is None:                                       # or a cube cut in two by a tape line across it (2026-11-03: a
+        big = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= CUBE_HALF_PX]   # cube pushed onto the alcove's
+        for a in big:                                      # back-wall tape: 559 + 483 px, missed)
+            for b in big:
+                if b <= a:
+                    continue
+                (xa, ya, wa, ha), (xb, yb, wb, hb) = stats[a, :4], stats[b, :4]
+                gap = max(max(xa, xb) - min(xa + wa, xb + wb), max(ya, yb) - min(ya + ha, yb + hb))
+                w_, h_ = max(xa + wa, xb + wb) - min(xa, xb), max(ya + ha, yb + hb) - min(ya, yb)
+                a_ = stats[a, cv2.CC_STAT_AREA] + stats[b, cv2.CC_STAT_AREA]
+                if gap <= CUBE_SPLIT_GAP_MM and a_ >= CUBE_MIN_PX and cube_sized(w_, h_) and a_ > area:
+                    best, area = [a, b], a_
     if best is None:
         return None
-    rows, cols = np.nonzero(lab == best)
+    rows, cols = np.nonzero(np.isin(lab, best))
     ox, oy = X0 + (cols + 0.5) / 10.0, Y1 - (rows + 0.5) / 10.0     # official cm
     camx, camy = to_official(arena.cam[:2])
     uc = np.array([(X0 + X1) / 2 - camx, (Y0 + Y1) / 2 - camy])
@@ -1897,6 +2056,17 @@ def cube_offset(cube, official):
     return dx * math.cos(h) + dy * math.sin(h), -dx * math.sin(h) + dy * math.cos(h)
 
 
+def drop_shift(bay, cube):
+    """(dx, dy) cm to stop short in a bay that already holds a cube, so the carried one (CLAW_HOLD_MM ahead) ends a cube
+    + 2 cm in front of it - never further in than the usual spot, nor out past the bay's mouth."""
+    (mx, my), (px, py) = spec.BAYS[bay]["mouth"], spec.BAYS[bay]["point"]
+    L = math.hypot(px - mx, py - my)
+    ax, ay = (px - mx) / L, (py - my) / L                  # into the bay
+    lying = (cube[0] - px) * ax + (cube[1] - py) * ay      # the cube already there, beyond the stop point (cm)
+    d = float(np.clip(lying - (CUBE_MM / 10 + 2) - CLAW_HOLD_MM / 10, -(L - 10), 0.0))
+    return d * ax, d * ay
+
+
 def dock_shift(station, cube):
     """(dx, dy) official cm to stop along the docking square so the robot is level with the cube - or, in a bay
     (driven into head-on), so the cube ends up CLAW_HOLD_MM + 2 cm ahead (the pick creeps the rest)."""
@@ -1913,6 +2083,9 @@ def dock_shift(station, cube):
     if station not in spec.STATIONS:
         return 0.0, 0.0
     dx, dy = cube[0] - spec.STATIONS[station]["dock"][0], cube[1] - spec.STATIONS[station]["dock"][1]
+    ux, uy = {"E": (1, 0), "W": (-1, 0), "N": (0, 1), "S": (0, -1)}[spec.STATIONS[station]["alcove"]]
+    dx += uy * CLAW_SIDE_MM / 10                           # facing the alcove, the claw is CLAW_SIDE_MM to the left
+    dy -= ux * CLAW_SIDE_MM / 10                           # (left = (-uy, ux)): stop so the CLAW is level with the cube
     lim = DOCK_SHIFT_MAX_CM
     if spec.STATIONS[station]["alcove"] in ("E", "W"):    # the lane runs north-south there: shift in y
         return 0.0, float(np.clip(dy, -lim, lim))
@@ -1937,6 +2110,24 @@ GOAL_KEYS.update({ord('d'): "DZ", ord('D'): "DZ", ord('7'): "P1", ord('8'): "P2"
 # --auto: the same keys, pressed by a script (H = heading test, then goals), one after the other
 AUTO_KEYS = {"H": ord('h'), "SYNC": ord('y'), "PICK": ord('k'), "DROP": ord('u'), "DZ": ord('d'), "P1": ord('7'), "P2": ord('8'), "P3": ord('9'),
              **{f"S{i}": ord(str(i)) for i in range(1, 7)}}
+FLEET = False                 # --fleet: several robots at once - share poses + routes (runs/coord/pose_<marker>.json)
+FLEET_PRIO = None             # --priority: lower = right of way where two routes cross (default: the marker id)
+FLEET_CLEAR_CM = 30           # another robot this close to my next stretch of route = in the way (2 x 10.6 cm turning
+                              # circle + margin: two 15 cm robots side by side need centres >= ~21 cm apart)
+FLEET_LOOK_CM = 60            # ... looking this far ahead along my route
+FLEET_PLAN = False            # --plan: follow the fleet planner's plan (runs/coord/plan_<marker>.json, fleet_plan.py):
+                              # its routes, and its waits-for-the-other rules (action dependency graph)
+PLAN_GATE_CM = 8              # a step whose rule isn't met yet: stop this far before entering its cell
+PLAN_CLEAR_CM, PLAN_LOOK_CM = 20, 25   # with a plan, the "robot in the way" check is only an emergency brake
+FLEET_STATUS = {}             # this robot's plan progress, published with its pose
+OTHER_POSES = []              # the other robots' (map mm (x, y), heading): find_cube leaves them out (2026-11-04: bot 1
+                              # "saw a cube" in DZ that was bot 2 still standing in the bay)
+DROP_VERIFY_CM = 4            # after a drop in a bay, out of it: a cube within this of where the claw let go = dropped
+DROP_REDO = 1                 # a drop that left no cube (still in the claw: bot 2 2026-11-04) -> drive in + drop again
+CUBE_HINTS = {}               # --cube-hint S3:61,168 - where a cube is that the camera can't see now (under a robot)
+START_CARRYING = False        # --carrying: the robot already holds a cube (a run carried on after a stop)
+COORD_DIR = os.path.join(HERE, "runs", "coord")   # --auto WAIT:name / POST:name: several robots' runs take turns
+WAIT_MAX_S = 300              # a WAIT longer than this = the other robot is stuck: stop
 AUTO_STEP_S = 90              # a scripted step taking longer than this = something is wrong: stop
 CAMERA_CHECK_S = 3.0          # every this many s, check the red boundary is still where it was mapped (0 = off)
 REMAP_PX = 4                  # boundary this far off the map in 3 readings in a row, and the black tape agrees
@@ -1945,6 +2136,126 @@ CAMERA_MOVED_PX = 8           # moved more than this -> camera bumped: stop the 
 CAMERA_STOP_PX = 25           # this far off in even one reading: stop at once (then re-map or wait)
 CAMERA_MOVED_N = 3            # ... seen this many times in a row, 0.4 s apart (one bad look = someone in the way)
 CAMERA_WAIT_S = 20            # then wait this long for the view to come back before giving up (--auto)
+
+
+def path_points(pts, look_cm, step_cm=2.0):
+    """Points every step_cm along the polyline pts (official cm), from its start to look_cm along it: [(s, (x, y))]."""
+    out, s0 = [(0.0, tuple(pts[0]))] if pts else [], 0.0
+    for a, b in zip(pts, pts[1:]):
+        L = math.hypot(b[0] - a[0], b[1] - a[1])
+        if L < 1e-6:
+            continue
+        d = step_cm - (s0 % step_cm) if s0 % step_cm else step_cm
+        while d <= L and s0 + d <= look_cm:
+            out.append((s0 + d, (a[0] + (b[0] - a[0]) * d / L, a[1] + (b[1] - a[1]) * d / L)))
+            d += step_cm
+        s0 += L
+        if s0 >= look_cm:
+            break
+    return out
+
+
+def load_plan():
+    """This robot's part of the fleet plan (written by tools/fleet_run.py --plan), or None."""
+    f = os.path.join(COORD_DIR, f"plan_{ROBOT_TAG_ID}.json")
+    try:
+        with open(f) as fh:
+            P = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    P["deps"] = {int(j): [(int(o), int(k)) for o, k in v] for j, v in P.get("deps", {}).items()}
+    return P
+
+
+def plan_progress(P, k, xy):
+    """The plan step the robot is at: the nearest of steps k .. k+4 (it only moves forward along its plan)."""
+    best, bd = k, math.dist(P["steps"][k][:2], xy)
+    for j in range(k + 1, min(len(P["steps"]), k + 5)):
+        d = math.dist(P["steps"][j][:2], xy)
+        if d < bd - 0.5:
+            best, bd = j, d
+    return best
+
+
+def plan_blocked(P, k, xy, others):
+    """None, or why to wait: the next plan step may only be entered once the robots planned there earlier have
+    reached their step (action dependency graph) - checked when the robot is about to cross into it."""
+    nxt = k + 1
+    if nxt >= len(P["steps"]):
+        return None
+    prog = {o["tag"]: o.get("progress", 0) for o in others if o.get("plan_version") == P.get("version")}
+    unmet = [(o, kk) for o, kk in P["deps"].get(nxt, []) if prog.get(o, 0) < kk]
+    if not unmet:
+        return None
+    (ax, ay), (bx, by) = P["steps"][k][:2], P["steps"][nxt][:2]
+    L = math.hypot(bx - ax, by - ay)
+    if L < 1e-6:
+        return None
+    ux, uy = (bx - ax) / L, (by - ay) / L
+    d = ((ax + bx) / 2 - xy[0]) * ux + ((ay + by) / 2 - xy[1]) * uy   # cm to the edge of the next cell
+    if d > PLAN_GATE_CM:
+        return None
+    o, kk = unmet[0]
+    return o, f"plan: waiting for marker {o} to get past its step {kk} (it is at {prog.get(o, 0)})"
+
+
+def fleet_publish(official, pose, path, state):
+    """This robot's pose and its next stretch of route, for the other robots' runs (written atomically)."""
+    os.makedirs(COORD_DIR, exist_ok=True)
+    f = os.path.join(COORD_DIR, f"pose_{ROBOT_TAG_ID}.json")
+    with open(f + ".tmp", "w") as fh:
+        json.dump({"tag": ROBOT_TAG_ID, "t": time.time(), "prio": FLEET_PRIO, "state": state,
+                   "xy": [round(official[0], 1), round(official[1], 1)], "heading": round(official[2], 1),
+                   "map": [round(float(pose[0][0]), 1), round(float(pose[0][1]), 1), round(float(pose[1]), 4)],
+                   "path": [[round(x, 1), round(y, 1)] for x, y in path],
+                   "progress": FLEET_STATUS.get("progress", 0), "plan_version": FLEET_STATUS.get("plan_version")}, fh)
+    try:
+        os.replace(f + ".tmp", f)
+    except OSError:                                        # (the other run reading it right now - next time)
+        pass
+
+
+def fleet_others():
+    """The other robots' last published poses. A robot whose run has ended stays where it is: still in the way, but
+    with no route (a stale file = not moving)."""
+    out = []
+    for f in glob.glob(os.path.join(COORD_DIR, "pose_*.json")):
+        try:
+            with open(f) as fh:
+                o = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if o.get("tag") == ROBOT_TAG_ID:
+            continue
+        if time.time() - o.get("t", 0) > 1.0:
+            o["path"] = []
+        out.append(o)
+    return out
+
+
+def fleet_blocked(path, official, others):
+    """None, or why to wait: another robot is ON my next FLEET_LOOK_CM of route (ahead of me), or its own next stretch
+    crosses mine and it has the right of way (lower priority number). The yielding robot stops; the other goes on."""
+    if len(path) < 2:
+        return None
+    look, clear = (PLAN_LOOK_CM, PLAN_CLEAR_CM) if FLEET_PLAN else (FLEET_LOOK_CM, FLEET_CLEAR_CM)
+    mine = path_points(path, look)
+    ux, uy = 0.0, 0.0
+    for _, (x, y) in mine[1:]:                             # which way I'm about to go (for "is it behind me")
+        if math.hypot(x - official[0], y - official[1]) > 3:
+            ux, uy = (x - official[0]), (y - official[1])
+            break
+    for o in others:
+        ox, oy = o["xy"]
+        ahead = (ox - official[0]) * ux + (oy - official[1]) * uy > 0
+        if ahead and any(math.hypot(ox - x, oy - y) < clear for s_, (x, y) in mine if s_ >= 4):
+            return o["tag"], f"marker {o['tag']} is in the way at ({ox:.0f}, {oy:.0f})"
+        prio = o.get("prio") if o.get("prio") is not None else o["tag"]
+        if not FLEET_PLAN and o.get("path") and len(o["path"]) >= 2 and prio < FLEET_PRIO:
+            theirs = path_points(o["path"], FLEET_LOOK_CM)
+            if any(math.hypot(qx - x, qy - y) < FLEET_CLEAR_CM for _, (x, y) in mine for _, (qx, qy) in theirs[::2]):
+                return o["tag"], f"marker {o['tag']}'s route crosses mine and it goes first"
+    return None
 
 
 def run(cam, calib, car_host, record, auto=None):
@@ -1976,11 +2287,12 @@ def _run(cam, calib, car_host, record, auto, box):
     car.start_telemetry()                                  # wheel encoders + the firmware's straight assist
     enc_said, stall_since, cam_stall = False, None, None
     bump, bumps, bump_end = None, 0, None                  # unstick move / tries since the last progress / where it ended
-    arm, carrying, stow_pending = None, False, False       # pickup arm task / a cube on board / stow when out
-    cubes, cubes_looked = {}, False                        # cube positions seen in the alcoves at the start
-    arm_ok = bool(calib.get("arm_calibrated"))
-    if arm_ok:
-        car.arm(calib["arm_deg"]["stow"])
+    arm, carrying, stow_pending = None, START_CARRYING, False   # pickup arm task / a cube on board / stow when out
+    cubes, cubes_looked = dict(CUBE_HINTS), False          # cube positions seen in the alcoves at the start
+                                                           # (--cube-hint: one the robot itself hides from the camera)
+    arm_ok = arm_angles(calib) is not None
+    if arm_ok:                                             # (--carrying: keep the cube gripped, don't open)
+        car.arm(arm_angles(calib)["carry" if carrying else "stow"])
     if arena.heading_offset is None:
         print("Put the robot in a lane with some room ahead and press H once (heading test).")
     detector, planner = make_detector(), Planner()
@@ -1993,10 +2305,55 @@ def _run(cam, calib, car_host, record, auto, box):
     no_shadow = np.zeros((arena.size[1], arena.size[0]), np.uint8)
     last_official, keepout_events, in_keepout = None, 0, False
     auto_t, auto_fail, auto_step = time.time() + 2.0, None, None   # (2 s for the camera to settle first)
+    auto_wait, run_t0, coord_t = None, time.time(), 0.0
+    fleet_t, fleet_seen, fleet_block, yielding, yield_t = 0.0, [], None, None, 0.0   # --fleet: others / why I wait
+    drop_verify, drop_redo, bay_recheck = None, {}, None
+    plan = load_plan() if FLEET_PLAN else None             # --plan: the fleet planner's routes + waiting rules
+    plan_k, plan_leg = 0, 0
+    if FLEET_PLAN:
+        if plan is None:
+            print(f"--plan: no plan_{ROBOT_TAG_ID}.json in {COORD_DIR} - driving without one")
+        else:
+            FLEET_STATUS.update(progress=0, plan_version=plan.get("version"))
+            print(f"--plan: version {plan.get('version')}, {len(plan['steps'])} steps, "
+                  f"{sum(len(v) for v in plan['deps'].values())} waiting rules, legs: "
+                  + ", ".join(L["goal"] for L in plan["legs"]))
+
+    def plan_route(goal_):
+        """The planned route for the next leg to goal_ (node names), or None."""
+        nonlocal plan_leg
+        if plan is None:
+            return None
+        for i in range(plan_leg, len(plan["legs"])):
+            if plan["legs"][i]["goal"] == goal_:
+                plan_leg = i + 1
+                return plan["legs"][i]["nodes"]
+        print(f"--plan: no planned leg to {goal_} left - choosing the route here")
+        return None   # after a drop: is the cube in the bay? / DZ drop spot again               # --auto WAIT:name - until runs/coord/name exists
     cam_check_t, cam_moved, cam_suspect = time.time() + 1.0, False, 0   # camera still where it was mapped?
     cam_job, cam_ok, cam_redo, cam_moved_t, cam_reads, remapped = None, 0, None, 0.0, [], False
-    jumps, last_mark, acquire = 0, None, []
+    jumps, last_mark, acquire, misses = 0, None, [], 0
     turn_log, turn_spoilt, turn_t, drive_log, learnt_was = None, False, [], [], learnt_calib(arena)
+    pick_verify, pick_redo = None, {}                      # is the picked cube really gone from its station? / retries
+    aligned_at = None                                      # station where the claw was already turned to face the cube
+    creep_trim = {}                                        # mm shorter creeps at a station where a pick pushed the cube
+
+    def note_push(st_, now_at):
+        """A pick failed and the cube is at now_at: aim there next time, and if the claw pushed it, creep shorter."""
+        was = cubes.get(st_)
+        if was is not None:
+            moved = math.hypot(now_at[0] - was[0], now_at[1] - was[1]) * 10
+            ux, uy = ({"E": (1, 0), "W": (-1, 0), "N": (0, 1), "S": (0, -1)}[spec.STATIONS[st_]["alcove"]]
+                      if st_ in spec.STATIONS else (0, 0))
+            deeper = ((now_at[0] - was[0]) * ux + (now_at[1] - was[1]) * uy) * 10   # mm further INTO the alcove
+            if 10 < deeper <= PUSH_MAX_MM and moved <= PUSH_MAX_MM:   # the creep overshot and pushed it in: shorter
+                creep_trim[st_] = min(CREEP_TRIM_MAX_MM, creep_trim.get(st_, 0) + deeper)
+                print(f"  the pick pushed the cube {deeper / 10:.1f} cm deeper - next creep there "
+                      f"{creep_trim[st_]:.0f} mm shorter")
+            elif moved > 10:                               # (2026-11-04: bot 2's cube slipped out of the claw in the
+                print(f"  the cube moved {moved / 10:.1f} cm - not a push by the creep (dropped on the way / moved by "
+                      "hand?): creep unchanged")           # turn, 17 cm away - the old rule then crept 30 mm short)
+        cubes[st_] = now_at
 
     while True:
         frame, t = cam.latest()
@@ -2013,7 +2370,9 @@ def _run(cam, calib, car_host, record, auto, box):
             last_t = t
             recent = t - last_seen < 1.0
             found = find_robot(frame, detector, arena, hint if recent else None,
-                               hint_heading if t - last_seen < 0.5 else None)
+                               hint_heading if t - last_seen < 0.5 else None,
+                               try_2x=misses % 3 == 2)    # (the slow 2x search: every 3rd frame without the robot)
+            misses = 0 if found else misses + 1
             tracking = last_seen and t - last_seen < 0.5
             if found and not tracking:                     # (re)finding the robot: no heading to go on, and
                 acquire = [p for p in acquire if t - p[0] < 1.0] + [(t, found[1])]   # ~1 in 8 far-off frames
@@ -2109,8 +2468,91 @@ def _run(cam, calib, car_host, record, auto, box):
                 last_official = official
                 if stow_pending and not any(x0 - 2 < official[0] < x1 + 2 and y0 - 2 < official[1] < y1 + 2
                                             for x0, y0, x1, y1 in spec.drivable_rects()):
-                    car.arm(calib["arm_deg"]["stow"])      # out of the bay: fold the arm in
+                    car.arm(arm_angles(calib)["stow"])     # out of the bay: fold the arm in
                     stow_pending = False
+                if pick_verify is not None and carrying:   # clear of the station: is its alcove empty now?
+                    st_ = pick_verify["station"]
+                    sx, sy = spec.NODES[st_]["xy"]
+                    if (math.hypot(official[0] - sx, official[1] - sy) >= PICK_VERIFY_CM
+                            and t - pick_verify["t"] >= 0.3):
+                        pick_verify["t"] = t
+                        c_ = find_cube(frame, arena, st_, pose, around_mm=PICK_VERIFY_AROUND_MM)
+                        pick_verify["seen" if c_ else "empty"] += 1
+                        if pick_verify["empty"] >= 4:
+                            print(f"PICK CONFIRMED: no cube at or near {st_} now - the cube came along.")
+                            pick_verify = None
+                        elif pick_verify["seen"] >= 2:
+                            print(f"PICK FAILED: the cube is still at {st_} ({c_[0]:.1f}, {c_[1]:.1f}) cm - not picked.")
+                            note_push(st_, c_)
+                            carrying, pick_verify, running, cmd = False, None, False, (0, 0)
+                            car.arm(arm_angles(calib)["release"])
+                            pick_redo[st_] = pick_redo.get(st_, 0) + 1
+                            if FLEET_PLAN:                 # (a retry would drive a route the plan doesn't know)
+                                auto_fail = auto_fail or f"pick at {st_} failed (plan: stopping - re-plan needed)"
+                            elif auto is not None and pick_redo[st_] <= PICK_REDO:
+                                print(f"  going back to {st_} to pick it again (retry {pick_redo[st_]} of {PICK_REDO})")
+                                auto[:0] = [st_, "PICK"] + ([auto_step] if auto_step not in (None, st_, "PICK") else [])
+                            else:
+                                auto_fail = auto_fail or f"pick at {st_} failed"
+            if drop_verify is not None and official is not None:   # out of the bay: did the cube stay there?
+                bx0, by0, bx1, by1 = spec.BAYS[drop_verify["bay"]]["rect"]
+                out_ = not (bx0 - 5 < official[0] < bx1 + 5 and by0 - 5 < official[1] < by1 + 5)
+                if out_ and t - drop_verify["t"] >= 0.3:
+                    drop_verify["t"] = t
+                    dx_, dy_ = drop_verify["at"]
+                    there = cube_at(frame, arena, (dx_, dy_), pose)
+                    if there is not None:                  # (None = can't see the spot: look again)
+                        drop_verify["seen" if there else "empty"] += 1
+                    if drop_verify["seen"] >= 2:
+                        print(f"DROP CONFIRMED: a cube is in {drop_verify['bay']} where the claw let go "
+                              f"({dx_:.1f}, {dy_:.1f}) cm.")
+                        drop_verify = None
+                    elif drop_verify["empty"] >= 4:
+                        b_ = drop_verify["bay"]
+                        print(f"DROP FAILED: no cube where the claw let go in {b_} ({dx_:.1f}, {dy_:.1f}) cm - "
+                              "still in the claw?")
+                        drop_verify, carrying, running, cmd = None, True, False, (0, 0)
+                        drop_redo[b_] = drop_redo.get(b_, 0) + 1
+                        if FLEET_PLAN:
+                            auto_fail = auto_fail or f"drop in {b_} failed (plan: stopping - re-plan needed)"
+                        elif auto is not None and drop_redo[b_] <= DROP_REDO:
+                            print(f"  driving into {b_} again and dropping again (retry {drop_redo[b_]} of {DROP_REDO})")
+                            auto[:0] = [b_, "DROP"] + ([auto_step] if auto_step not in (None, b_, "DROP") else [])
+                        else:
+                            auto_fail = auto_fail or f"drop in {b_} failed"
+            if (bay_recheck is not None and official is not None and running and mode == "route" and carrying
+                    and goal == bay_recheck):              # (a cube may have arrived in the bay since the route began:
+                mx_, my_ = spec.BAYS[goal]["mouth"]        # look again just before driving in)
+                bx0, by0, bx1, by1 = spec.BAYS[goal]["rect"]
+                busy_bay = any(bx0 - 20 < o["xy"][0] < bx1 + 20 and by0 - 20 < o["xy"][1] < by1 + 20 for o in fleet_seen)
+                if math.hypot(official[0] - mx_, official[1] - my_) < 35 and not busy_bay:
+                    bay_recheck = None
+                    c_ = find_cube(frame, arena, goal, pose)
+                    new_shift = drop_shift(goal, c_) if c_ is not None else (0.0, 0.0)
+                    if math.hypot(new_shift[0] - goal_shift[0], new_shift[1] - goal_shift[1]) > 1.5:
+                        goal_shift = new_shift
+                        print(f"{goal}: looked again at the mouth - " + (
+                            f"a cube lies at ({c_[0]:.1f}, {c_[1]:.1f}) cm, stopping {math.hypot(*goal_shift):.1f} cm "
+                            "short" if c_ is not None else "the bay is empty, going to the usual spot"))
+                        if not follower.go(*official, goal, shift=goal_shift, route_nodes=follower.route_nodes):
+                            running = False
+                            auto_fail = auto_fail or f"{goal}: {follower.state}"
+            if FLEET and official is not None:             # several robots: share where I am and where I go next
+                path = ([official[:2]] + [tuple(p_) for p_ in follower.route_points()[1:]]
+                        if (running and mode == "route" and test is None and arm is None) else [])
+                if t - fleet_t >= 0.1:
+                    fleet_t = t
+                    fleet_publish(official, pose, path, state)
+                    fleet_seen = fleet_others()
+                    OTHER_POSES[:] = [((o["map"][0], o["map"][1]), o["map"][2]) for o in fleet_seen if "map" in o]
+                fleet_block = fleet_blocked(path, official, fleet_seen) if path else None
+                if plan is not None:                       # follow the plan: where am I on it, may I go on?
+                    k_ = plan_progress(plan, plan_k, official[:2])
+                    if k_ != plan_k:
+                        plan_k = k_
+                        FLEET_STATUS["progress"] = plan_k
+                    if path and fleet_block is None:
+                        fleet_block = plan_blocked(plan, plan_k, official[:2], fleet_seen)
             follower.turn_sign = arena.turn_sign           # (the H test may have changed it)
             follower.carrying = carrying                   # (drives a bit off-centre: the cube sticks out)
             if test is not None:
@@ -2121,7 +2563,8 @@ def _run(cam, calib, car_host, record, auto, box):
                             auto_fail = auto_fail or "SYNC failed"
                         elif (arena.new_mark or not np.any(arena.turn_centre)) and auto is not None:
                             arena.new_mark = False                 # (new mark, or turning point not known)
-                            if pose is not None and room_to_turn(pose):
+                            if (pose is not None and room_to_turn(pose)          # (only where turning is meant to
+                                    and lane_follow.roomy(to_official(pose[0]))):   # happen: in a bay it touched the tape)
                                 print("SYNC: room to turn here - running the heading test (H) to measure the "
                                       "new mark's turning point.")
                                 auto.insert(0, "H")
@@ -2140,7 +2583,16 @@ def _run(cam, calib, car_host, record, auto, box):
                         ahead, lft = cube_offset(left, official)
                         print(f"PICK MISSED: a cube is still in the alcove at ({left[0]:.1f}, {left[1]:.1f}) cm "
                               f"({ahead:.1f} cm ahead, {lft:+.1f} cm left).")
-                        if arm["try"] < PICK_TRIES:
+                        st_ = arm["station"]
+                        note_push(st_, left)
+                        if auto is not None and pick_redo.get(st_, 0) < PICK_REDO:   # (the miss usually pushed the
+                            pick_redo[st_] = pick_redo.get(st_, 0) + 1           # cube: line up with it afresh)
+                            print(f"  driving onto {st_}'s docking square again, lined up with it, and picking again "
+                                  f"(retry {pick_redo[st_]} of {PICK_REDO})")
+                            car.arm(arm_angles(calib)["release"])
+                            auto[:0] = [st_, "PICK"]
+                            arm, done = None, False
+                        elif arm["try"] < PICK_TRIES:
                             creep = int(np.clip(ahead * 10 - CLAW_HOLD_MM, 0, CREEP_MAX_MM))
                             print(f"  trying again: creep {creep} mm")
                             arm = dict(arm_task("pick", calib, creep), station=arm["station"],
@@ -2152,14 +2604,21 @@ def _run(cam, calib, car_host, record, auto, box):
                             arm = None
                             done = False
                     else:
-                        print("Pick check: no cube left in the alcove.")
+                        print("Pick check: no cube seen in the alcove (the robot may hide it - checked again on the way).")
                 if done:
                     if arm["kind"] == "pick":
                         carrying = True
                         print("PICKED: claw closed on the cube (carry).")
+                        if arm.get("station"):             # confirm once the robot is clear of the station
+                            pick_verify = {"station": arm["station"], "seen": 0, "empty": 0, "t": 0.0}
                     else:
                         carrying, stow_pending = False, True
                         print("DROPPED: arm open - the arm stows once the robot is out of the bay.")
+                        if arm.get("bay") and official is not None:   # checked once the robot is out of the bay
+                            hr = math.radians(official[2])
+                            at = (official[0] + CLAW_HOLD_MM / 10 * math.cos(hr) - CLAW_SIDE_MM / 10 * math.sin(hr),
+                                  official[1] + CLAW_HOLD_MM / 10 * math.sin(hr) + CLAW_SIDE_MM / 10 * math.cos(hr))
+                            drop_verify = {"bay": arm["bay"], "at": at, "seen": 0, "empty": 0, "t": 0.0}
                         if arm.get("place") and pose is not None:
                             c_ = find_cube(frame, arena, arm["place"], pose)
                             print(f"  placed: cube seen in {arm['place']}'s alcove at ({c_[0]:.1f}, {c_[1]:.1f}) cm"
@@ -2170,7 +2629,20 @@ def _run(cam, calib, car_host, record, auto, box):
             elif pose is None:
                 if t - last_seen > LOST_S:                   # short dropouts: keep the last command
                     cmd, state = (0, 0), "NO ROBOT"
+            elif mode == "route" and fleet_block is not None:   # another robot in the way / going first: wait
+                cmd, state, turn_spoilt = (0, 0), "YIELD", True
+                if yielding is None:
+                    yield_t = t
+                    print(f"YIELD: {fleet_block[1]} - waiting", flush=True)
+                yielding = fleet_block
             elif mode == "route":
+                if yielding is not None:                   # clear again: re-plan from where it stopped
+                    print(f"  clear after {t - yield_t:.1f} s - going on to {goal}", flush=True)
+                    yielding = None
+                    if not follower.go(*official, goal, shift=goal_shift, route_nodes=follower.route_nodes):
+                        running = False
+                        print(f"Can't go on to {goal}: {follower.state}" + FOLLOW_HELP.get(follower.state, ""))
+                        auto_fail = auto_fail or f"{goal}: {follower.state}"
                 l, r, state = follower.update(t, *official)
                 cmd = (to_pwm(l), to_pwm(r))
                 if bump is not None:                       # unsticking: back off, push harder (then normal again)
@@ -2226,12 +2698,6 @@ def _run(cam, calib, car_host, record, auto, box):
                 in_keepout = depth > 0.5
                 info = [f"x {official[0]:5.1f}  y {official[1]:5.1f} cm  heading {official[2]:3.0f} deg"
                         f"   {'goal ' + goal if mode == 'route' and goal else 'ROAM' if mode == 'roam' else ''}"]
-            view = draw(frame, top, tape, arena, tag_px, pose, plan, state, base, cmd, fps, running,
-                        follower.route_points() if mode == "route" else None, info, warn)
-            cv2.imshow("arena", view)
-            if rec:
-                rec.frame(view, state, base, fps, pose, plan, cmd, running, official, goal if mode == "route" else
-                          mode, warn is not None, found[0] if found else None)
         if frame is not None and time.time() - t > 0.3:     # camera froze -> stop
             cmd, state = (0, 0), "NO CAMERA"
         if not enc_said and time.time() - auto_t > 0:      # (2 s after start) did the encoders answer?
@@ -2272,10 +2738,23 @@ def _run(cam, calib, car_host, record, auto, box):
         if new or time.time() - last_send > 0.05:           # keep-alive at 20 Hz minimum
             car.send(*cmd)
             last_send = time.time()
+        if new:                                            # (after the command went out: drawing, showing and
+                                                           # recording take ~15 ms, which delayed every command)
+            view = draw(frame, top, tape, arena, tag_px, pose, plan, state, base, cmd, fps, running,
+                        follower.route_points() if mode == "route" else None, info, warn)
+            cv2.imshow("arena", view)
+            if rec:
+                rec.frame(view, state, base, fps, pose, plan, cmd, running, official, goal if mode == "route" else
+                          mode, warn is not None, found[0] if found else None)
 
         k = cv2.waitKey(1) & 0xFF
         if auto is not None:                               # --auto: press the next key when idle
-            busy = test is not None or running or cam_moved or arm is not None   # (camera suspect: wait)
+            if FLEET and time.time() - coord_t > 0.25:     # another robot's run failed: stop where we are
+                coord_t = time.time()
+                if not auto_fail and os.path.exists(os.path.join(COORD_DIR, "abort")):
+                    auto_fail, running, test = "another robot's run stopped (abort)", False, None
+                    print("--auto: ABORT from the other robot's run - stopping", flush=True)
+            busy =test is not None or running or cam_moved or arm is not None   # (camera suspect: wait)
             if cam_moved and time.time() - cam_moved_t > CAMERA_WAIT_S:
                 auto_fail = auto_fail or "camera moved (restart: it maps the arena at every start)"
                 busy = False
@@ -2284,14 +2763,32 @@ def _run(cam, calib, car_host, record, auto, box):
                 running, test = False, None
             if auto_step == "H" and test is None and arena.heading_offset is None:
                 auto_fail = auto_fail or "heading test failed"
+            if auto_wait is not None:                      # (the robot stands still meanwhile)
+                if os.path.exists(os.path.join(COORD_DIR, auto_wait)):
+                    print(f"--auto: {auto_wait} - go on ({time.time() - auto_t:.1f} s waited)", flush=True)
+                    auto_wait, auto_t = None, time.time() - 1.5
+                elif os.path.exists(os.path.join(COORD_DIR, "abort")):
+                    auto_fail, auto_wait = auto_fail or "another robot's run stopped (abort)", None
+                elif time.time() - auto_t > WAIT_MAX_S:
+                    auto_fail, auto_wait = auto_fail or f"waited {WAIT_MAX_S} s for {auto_wait}", None
+                busy = busy or auto_wait is not None
             if k == 255 and not busy and time.time() - auto_t > 1.5:
                 if auto_fail or not auto:
-                    print("--auto: " + (f"STOPPED - {auto_fail}" if auto_fail else "all steps done"))
+                    print("--auto: " + (f"STOPPED - {auto_fail}" if auto_fail else "all steps done")
+                          + f"  (t={time.time() - run_t0:.1f} s)", flush=True)
                     k = ord('q')
                 else:
                     auto_step = auto.pop(0)
-                    print(f"--auto: {auto_step}")
-                    k, auto_t = AUTO_KEYS[auto_step], time.time()
+                    print(f"--auto: {auto_step}  (t={time.time() - run_t0:.1f} s)", flush=True)
+                    if auto_step.startswith("WAIT:"):
+                        auto_wait, auto_t = auto_step[5:], time.time()
+                    elif auto_step.startswith("POST:"):
+                        os.makedirs(COORD_DIR, exist_ok=True)
+                        with open(os.path.join(COORD_DIR, auto_step[5:]), "w") as f_:
+                            f_.write(f"{time.time()}\n")
+                        auto_t = time.time() - 1.5         # (no pause after a signal)
+                    else:
+                        k, auto_t = AUTO_KEYS[auto_step], time.time()
         if k in GOAL_KEYS and OFFICIAL and test is None:   # drive to a station / bay
             if arena.heading_offset is None:
                 print("Press H first (heading test) - the script doesn't know where the robot's front is yet.")
@@ -2300,6 +2797,7 @@ def _run(cam, calib, car_host, record, auto, box):
                 auto_fail = auto_fail or "robot not seen when a goal was due"   # (--auto: don't skip it)
             else:
                 goal, mode = spec.goal_node(GOAL_KEYS[k]), "route"     # no cut-outs: a bay -> its mouth
+                aligned_at, follower.align_deg = None, lane_follow.ALIGN_DEG
                 bump, bumps, bump_end = None, 0, None
                 goal_shift = (0.0, 0.0)
                 if ((goal in spec.STATIONS or goal in spec.BAYS) and lane_follow.PICK_SIDE == "front"
@@ -2310,7 +2808,14 @@ def _run(cam, calib, car_host, record, auto, box):
                         goal_shift = dock_shift(goal, c_)
                         print(f"{goal}: cube at ({c_[0]:.1f}, {c_[1]:.1f}) cm - stopping "
                               f"{goal_shift[0]:+.1f}, {goal_shift[1]:+.1f} cm along the docking square")
-                if follower.go(*last_official, goal, shift=goal_shift):
+                elif goal in spec.BAYS and carrying and pose is not None:   # dropping where a cube already lies:
+                    c_ = find_cube(frame, arena, goal, pose)              # stop short, so the new one lands in front
+                    if c_ is not None:
+                        goal_shift = drop_shift(goal, c_)
+                        print(f"{goal}: a cube already lies at ({c_[0]:.1f}, {c_[1]:.1f}) cm - stopping "
+                              f"{math.hypot(*goal_shift):.1f} cm short of the usual spot")
+                bay_recheck = goal if (goal in spec.BAYS and carrying and FLEET) else None
+                if follower.go(*last_official, goal, shift=goal_shift, route_nodes=plan_route(goal)):
                     running = True
                     print(f"Going to {goal}: " + " -> ".join(f"({p[0]:.0f},{p[1]:.0f})" for p in follower.route_points()))
                 else:
@@ -2329,7 +2834,8 @@ def _run(cam, calib, car_host, record, auto, box):
                     elif time.time() - last_seen > LOST_S:        # don't re-plan from an old position
                         running = False
                         print("Can't see the robot's marker - can't re-plan from where it is now.")
-                    elif not follower.go(*last_official, goal, shift=goal_shift):   # re-plan from where it is now
+                    elif not follower.go(*last_official, goal, shift=goal_shift,     # re-plan from where it is now
+                                         route_nodes=follower.route_nodes):
                         running = False
                         print(f"Can't go on to {goal}: {follower.state}" + FOLLOW_HELP.get(follower.state, ""))
         elif k in (ord('k'), ord('K'), ord('u'), ord('U')) and not running and test is None and arm is None:
@@ -2359,19 +2865,36 @@ def _run(cam, calib, car_host, record, auto, box):
                     ahead, _ = cube_offset(mid, last_official)
                     creep = int(np.clip(ahead * 10 - CLAW_HOLD_MM, 0, CREEP_MAX_MM))
                     print(f"DROP: placing the cube in {here}'s alcove - creep {creep} mm, open, back out")
+                align = False
                 if (kind == "pick" and lane_follow.PICK_SIDE == "front" and (here in spec.STATIONS or here in spec.BAYS)
                         and pose is not None):
                     c_ = find_cube(frame, arena, here, pose) or cubes.get(here)
                     if c_ is not None:
                         ahead, lft = cube_offset(c_, last_official)
-                        creep = int(np.clip(ahead * 10 - CLAW_HOLD_MM, 0, CREEP_MAX_MM))
-                        print(f"PICK: cube at ({c_[0]:.1f}, {c_[1]:.1f}) cm = {ahead:.1f} cm ahead, {lft:+.1f} cm left"
-                              f" -> creep {creep} mm")
+                        creep = int(np.clip(ahead * 10 - CLAW_HOLD_MM - creep_trim.get(here, 0), 0, CREEP_MAX_MM))
+                        side = lft - CLAW_SIDE_MM / 10             # (cm the cube is to the left of the claw's line)
+                        print(f"PICK: cube at ({c_[0]:.1f}, {c_[1]:.1f}) cm = {ahead:.1f} cm ahead, {side:+.1f} cm left of"
+                              f" the claw -> creep {creep} mm")
+                        if (abs(side) > PICK_ALIGN_CM and here in spec.STATIONS and aligned_at != here
+                                and abs(math.degrees(math.atan2(side, ahead))) <= PICK_ALIGN_MAX_DEG):
+                            # the creep goes straight along the nose: first turn on the docking square so the claw
+                            # faces the cube (else it pushes the cube aside - real run 2026-11-03: 4.7 cm off, 9 cm push)
+                            R = math.hypot(ahead, lft)
+                            turn_ = math.atan2(lft, ahead) - math.asin(max(-1.0, min(1.0, CLAW_SIDE_MM / 10 / R)))
+                            follower._reset_tries()
+                            follower.align_deg = PICK_ALIGN_DEG
+                            follower.final_heading = math.radians(last_official[2]) + turn_
+                            follower.state, running, aligned_at, align = "FINAL TURN", True, here, True
+                            print(f"PICK: turning {math.degrees(turn_):+.0f} deg first, so the claw faces the cube")
+                            if auto is not None:
+                                auto.insert(0, "PICK")
                     else:
                         print(f"PICK: no cube seen in the alcove - creeping the default {PICK_CREEP_MM} mm")
-                print("PICK: open, creep in, close ..." if kind == "pick" else "DROP: opening the claw ...")
-                arm = dict(arm_task(kind, calib, creep), station=here if kind == "pick" else None, **{"try": 1},
-                           place=here if (kind == "drop" and creep) else None)
+                if not align:
+                    print("PICK: open, creep in, close ..." if kind == "pick" else "DROP: opening the claw ...")
+                    arm = dict(arm_task(kind, calib, creep), station=here if kind == "pick" else None, **{"try": 1},
+                               place=here if (kind == "drop" and creep) else None,
+                               bay=here if (kind == "drop" and here in spec.BAYS) else None)
         elif k in (ord('r'), ord('R')) and test is None:
             mode, running = "roam", False
             print("Roam mode: SPACE = start/stop. Press a goal key to go back to driving routes.")
@@ -2438,6 +2961,7 @@ def find_cameras():
 
 
 def main():
+    global ROBOT_TAG_ID, COORD_DIR, START_CARRYING, FLEET, FLEET_PRIO, FLEET_PLAN, CLAW_HOLD_MM, CLAW_TIP_MM, CLAW_SIDE_MM
     ap = argparse.ArgumentParser(description="Webcam watches the arena, robot drives between the tape lines.")
     ap.add_argument("--find", action="store_true", help="show each camera number")
     ap.add_argument("--make-tag", action="store_true", help="save robot_tag.png to print")
@@ -2450,7 +2974,18 @@ def main():
     ap.add_argument("--arena-w", type=float, default=None, help="setup: length of the 1st-2nd click side, mm")
     ap.add_argument("--arena-h", type=float, default=None, help="setup: length of the 2nd-3rd click side, mm")
     ap.add_argument("--car", default=CAR_HOST, help="robot address (car1.local or its IP)")
+    ap.add_argument("--tag", type=int, default=None,
+                    help=f"the robot's marker id: 11 = bot 1, 10 = bot 2 (default {ROBOT_TAG_ID}). Its own calibration "
+                         "(heading, turning point, claw) is kept under that id in arena_calib.json")
     ap.add_argument("--record", action="store_true", help="save pictures + decisions to laptop/runs/")
+    ap.add_argument("--fleet", action="store_true",
+                    help="several robots at once: share poses/routes in runs/coord, yield to a robot in the way")
+    ap.add_argument("--plan", action="store_true", help="--fleet: follow runs/coord/plan_<marker>.json (fleet_plan.py)")
+    ap.add_argument("--priority", type=int, default=None, help="--fleet: lower = right of way (default: the marker id)")
+    ap.add_argument("--cube-hint", action="append", default=[], metavar="ST:X,Y",
+                    help="a cube the camera can't see now (e.g. under the robot): S3:61,168 (official cm)")
+    ap.add_argument("--carrying", action="store_true", help="the robot already holds a cube: grip it, don't open")
+    ap.add_argument("--coord", default=None, help="folder for --auto WAIT:name / POST:name (default runs/coord)")
     ap.add_argument("--orders", default=None, metavar="STATIONS",
                     help="fulfil orders, e.g. S1,S4: for each -> drive there, PICK, drive to DZ, DROP (after --auto steps)")
     ap.add_argument("--auto", default=None, metavar="STEPS",
@@ -2463,10 +2998,23 @@ def main():
         find_cameras()
         return
 
-    calib = None
-    if os.path.exists(CALIB_FILE):
-        with open(CALIB_FILE) as f:
-            calib = json.load(f)
+    if a.tag is not None:
+        ROBOT_TAG_ID = a.tag
+    if a.coord:
+        COORD_DIR = os.path.abspath(a.coord)
+    START_CARRYING = a.carrying
+    for h_ in a.cube_hint:
+        st_, xy_ = h_.split(":")
+        CUBE_HINTS[st_.upper()] = tuple(float(v) for v in xy_.split(","))
+    FLEET = a.fleet or a.plan
+    FLEET_PLAN = a.plan
+    FLEET_PRIO = a.priority if a.priority is not None else ROBOT_TAG_ID
+    calib = load_calib()
+    if calib and "claw_hold_mm" in calib:                  # this robot's claw (else bot 1's, above)
+        CLAW_HOLD_MM, CLAW_SIDE_MM = calib["claw_hold_mm"], calib.get("claw_side_mm", 0)
+        CLAW_TIP_MM = CLAW_HOLD_MM + 30
+    print(f"Robot: marker {ROBOT_TAG_ID}; claw holds the cube {CLAW_HOLD_MM:.0f} mm ahead, {CLAW_SIDE_MM:+.0f} mm left "
+          "of the turning point")
     src = a.camera if a.camera is not None else (calib or {}).get("camera", CAMERA)
     if isinstance(src, str) and src.isdigit():
         src = int(src)
@@ -2494,7 +3042,7 @@ def main():
                 print(f"--orders: {st} is not a station (S1-S6)")
                 return
             steps += [st, "PICK", "DZ", "DROP"]
-        bad = [s for s in steps if s not in AUTO_KEYS]
+        bad = [s for s in steps if s not in AUTO_KEYS and not s.startswith(("WAIT:", "POST:"))]
         if bad:
             print("--auto: unknown step(s)", bad, "- use SYNC, H, S1-S6, DZ, P1-P3, PICK, DROP")
             return

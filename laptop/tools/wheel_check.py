@@ -58,7 +58,7 @@ def drive(left, right, secs):
 
 cam = arena = det = None
 if a.camera:
-    calib = json.load(open(ad.CALIB_FILE))
+    calib = ad.load_calib()
     arena, det = ad.Arena(calib), ad.make_detector()
     cam = ad.Camera(calib.get("camera", 0))
     t0 = time.time()

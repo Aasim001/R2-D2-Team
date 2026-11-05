@@ -18,13 +18,13 @@ import cv2, numpy as np
 SP = os.path.dirname(os.path.abspath(__file__))
 sx, sy, sh, steps = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
 DRIFT = float(sys.argv[5]) if len(sys.argv) > 5 else 0.0
-calib = json.load(open(ad.CALIB_FILE))
+calib = ad.load_calib()
 _bg = cv2.imread(os.path.join(SP, "e2e_background.png"))     # map from the background frame itself (as at start)
 calib["corners_px"], _ = ad.red_boundary_corners(_bg)
 calib["focal_px"], calib["camera_mm"] = ad.camera_pose(calib["corners_px"], ad.ARENA_MM, ad.ARENA_MM, (1920, 1080))
 calib0 = [list(c) for c in calib["corners_px"]]
 if os.environ.get("ARM_OK"):                       # pretend the arm has been calibrated (sim only)
-    calib["arm_calibrated"], calib["arm_deg"] = True, dict(ad.ARM_DEFAULT)
+    calib["arm_deg_by_tag"] = {str(ad.ROBOT_TAG_ID): dict(ad.ARM_DEFAULT)}
 saved = {}
 ad.save_calib = lambda c: saved.update(c)          # never touch the real calib
 ad.HERE = SP                                       # recordings into the scratchpad

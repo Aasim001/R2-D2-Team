@@ -31,7 +31,7 @@ def tape_offsets(frame, corners):
     return np.array(out)
 
 if __name__ == "__main__":
-    calib = json.load(open(ad.CALIB_FILE)); ref = np.array(calib["corners_px"])
+    calib = ad.load_calib(); ref = np.array(calib["corners_px"])
     f = cv2.imread(os.path.join(HERE, "empty_arena_2026-10-08.png"))
     for name, c in [("saved map", ref)] + [(f"shifted {dx:+d},{dy:+d} px", ref + [dx, dy]) for dx, dy in ((4, 0), (8, 0), (0, 8), (12, 0), (0, 12), (-12, -12))] + \
                    [("one corner +12 px", ref + [[12, 0], [0, 0], [0, 0], [0, 0]])]:

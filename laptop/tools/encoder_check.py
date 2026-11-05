@@ -8,7 +8,7 @@ import numpy as np
 ip = sys.argv[1] if len(sys.argv) > 1 else "192.168.43.93"
 pwm = int(sys.argv[2]) if len(sys.argv) > 2 else 115
 secs = float(sys.argv[3]) if len(sys.argv) > 3 else 0.4
-calib = json.load(open(ad.CALIB_FILE)); arena = ad.Arena(calib)
+calib = ad.load_calib(); arena = ad.Arena(calib)
 cam = ad.Camera(calib.get("camera", 0))
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.settimeout(0.2); addr = (ip, 4210)
 tele, stop = [], threading.Event()

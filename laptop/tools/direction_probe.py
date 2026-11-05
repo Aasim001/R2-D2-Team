@@ -22,7 +22,7 @@ def moment_dir(floor):
 
 if __name__ == "__main__":
     N = int(sys.argv[1]) if len(sys.argv) > 1 else 90
-    calib = json.load(open(ad.CALIB_FILE)); arena = ad.Arena(calib)
+    calib = ad.load_calib(); arena = ad.Arena(calib)
     cap = ad.open_camera(calib.get("camera", 0)); old, new, el, pos = [], [], [], []
     for i in range(N + 10):
         ok, f = cap.read()

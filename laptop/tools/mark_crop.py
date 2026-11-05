@@ -4,7 +4,7 @@ import os, sys, json, math
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, os.path.dirname(HERE))
 import arena_drive as ad          # (first: it sets the webcam option OpenCV must see before loading)
 import numpy as np, cv2
-calib = json.load(open(ad.CALIB_FILE)); arena = ad.Arena(calib)
+calib = ad.load_calib(); arena = ad.Arena(calib)
 cap = ad.open_camera(calib.get("camera", 0)); hs, f = [], None
 for i in range(40):
     ok, fr = cap.read()

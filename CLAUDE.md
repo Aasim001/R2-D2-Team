@@ -936,3 +936,39 @@ cross the tape.
 - Git: this folder had no repository (it is a copy of the 10-08 state); a local repo was created 2026-11-02. The
   GitHub repo (Aasim001/R2-D2) answered "not found" without a login and has later history (10-10..10-12) - don't push
   onto it without the owner deciding how to merge.
+
+### 2026-11-03: speed pass, wheel calibration, bot 2's claw
+- **Stable snapshot first:** tag `stable-2026-11-03` (commit a97b7c0) = the code of the two full deliveries on 11-02
+  (driving at BASE_PWM 110 / PIVOT_PWM 160). `git checkout stable-2026-11-03` goes back to it.
+- **Measured** (not guessed):
+  - Real command -> seen-motion delay, from 41 drive starts in the 11-02 runs: median 213 ms = the simulator's
+    3-4 frame lag. Wi-Fi (A34 hotspot) round trip to bot 2: median 9 ms, p99 54 ms - not the bottleneck.
+  - Per frame at 1080p: marker tracking 3.7 ms, top-down warp 1.3 ms, drawing the window 11.3 ms (8.5 of it in two
+    numpy lines), imshow 2-6 ms, recording 2.6 ms, lost-robot search 50 ms (13 ms at 1x + 37 ms at 2x).
+  - Standing still, the camera pose changes <= 0.14 cm over 0.15 s (99 %).
+  - Simulator: the robot spent 25 % of a route SETTLING after stops/turns.
+- **Changes:**
+  - `lane_follow`: BASE_PWM 110 -> 160, PIVOT_PWM 160 -> 220 (speed sweep: fastest that stays accurate; 200+ weaves,
+    255 fails legs), SETTLE_S 0.3 -> 0.15, new STILL_S 0.25 -> 0.15. `simulate()` also returns the route time.
+  - `arena_drive`: the drive command is sent BEFORE drawing / showing / recording (~15 ms less delay per frame);
+    `draw()` uses cv2.convertScaleAbs + copyTo (11.3 -> ~3 ms); the slow 2x marker search runs only on every 3rd
+    frame without the robot (`find_robot(try_2x=)`).
+  - Firmware: a new drive packet runs the control step at once (it waited for the next 20 ms tick, 10 ms on
+    average); the wheel-speed filter is time-based (RATE_TAU_S) because steps are now 4-20 ms apart. Flashed to
+    bot 2 over USB and used for the claw tests; NOT yet on bot 1.
+- **Results (simulation):** 10-stop route 257 -> ~133 s. e2e claw test (ArUco, S6 pick -> DZ -> P3) 59.4 -> 55.8 s,
+  same accuracy. e2e colour test (harder: marker 3.3 cm off the turning point) 87-89 -> 52-53 s, the same number of
+  keep-out frames, but the worst touch 2.1-3.0 -> 3.5-3.7 cm, now during turns. Delay sensitivity: at 160/220 it is
+  fine up to ~133 ms of pure lag (real ~113), weaves at 200 ms - so keep the delay low. NOT yet run on the real arena.
+- **tools/wheel_calibrate.py** (new): each N20 alone (start PWM, speed vs PWM, both ways) and `--moves` (all four:
+  forward/back/turns, left/right balance); reports crossed motor/encoder wiring. Bot 2: all within 4 %, left side
+  ~1.5 % slower - no per-wheel gain needed. Its motors are counted by the OTHER wheel's encoder on the same side
+  (front <-> rear crossed) - fix the wiring (case A: swap green/yellow D4/D35 <-> TX2/VP and RX2/VN <-> D5/D15, or
+  case B: swap white/red front <-> rear driver outputs; which one depends on which wheel spins for `wheel fl`).
+- **USB power back-feeds the motors:** with only USB plugged in, VIN -> LM2596 OUT+ leaks back to VBAT (~4 V), so the
+  wheels turn weakly and the LEDs light. Keep the battery on whenever the motors or servo run.
+- **Bot 2's claw** (new metal-gear servo, calibrated from a front camera view): higher angle closes (like bot 1);
+  open 30, wide open 20, grip 44 (tested: crept 79 mm to a cube, closed, reversed - the cube came along); the jaws
+  touch at 51 without a cube. Claw angles are now PER ROBOT: `arena_calib.json` `arm_deg_by_tag` {"11": bot 1, "10":
+  bot 2}; `arena_drive.arm_angles()` picks ROBOT_TAG_ID's (none = claw locked); `tools/arm_calibrate.py IP [MARKER]`.
+- Also: an iPhone hotspot is 5 GHz unless "Maximize Compatibility" is on (the ESP32 needs 2.4 GHz).

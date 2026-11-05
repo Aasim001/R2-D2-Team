@@ -32,21 +32,30 @@ PIVOT_MIN_PWM = 130       # small turns (timed pulses) start at this (was MIN_PW
 ALIGN_DEG   = 5           # a turn is done within this
 BEND_DEG    = 12          # a change of direction bigger than this at a node = a bend (stop and turn there)
 REALIGN_DEG = 35          # heading this far off while driving -> stop and turn first
-MAX_APPROACH_DEG = 25     # steer back to the centre line at no more than this angle (must stay well under
+MAX_APPROACH_DEG = 10     # steer back to the centre line at no more than this angle (must stay well under
                           # REALIGN_DEG, or a robot a few cm off would re-turn, line up, and re-turn forever)
 STOP_CM     = 1.0         # a stop point is reached within this (along the lane)
 EDGE_SHORT_CM = 1.0       # stopping at a junction with the outer edge straight ahead: aim this much short,
                           # so an overshoot can't put the robot's turning circle over the edge
 SLOW_CM     = 12          # start slowing down this far before a stop point
-SETTLE_S    = 0.3         # wait this long after stopping before checking again
-K_CROSS     = 0.20        # rad of heading correction per cm away from the centre line (was 0.10)
+SETTLE_S    = 0.15        # wait this long after stopping before checking again (was 0.3)
+STILL_S     = 0.15        # ... and until the camera has seen no movement for this long (was 0.25). Standing still,
+                          # the real camera's pose changes <= 0.14 cm over 0.15 s (99 %, runs of 2026-11-02), well
+                          # under the 0.6 cm "still" limit. Simulator: 10-stop route 142.5 -> 132.9 s, same accuracy
+K_CROSS     = 0.10        # rad of heading correction per cm away from the centre line. 0.10 + MAX_APPROACH_DEG 10 +
+                          # K_INT 0.15 (were 0.20 / 25 / 0.30, tuned at BASE_PWM 110): at 160 bot 2 snaked +-2 cm / +-12 deg
+                          # with a 2.9 s period (real run 2026-11-03). Simulator with bot 2's measured steering (0.13 s
+                          # delay, ~0.3 deg/s per PWM): lane error p95 2.4 -> 1.5 cm, keep-out 1.5 -> 0.3 % of the time
 K_HEAD      = 0.6         # turn strength per rad of heading error (as a fraction of the speed) (was 0.35)
 K_RATE      = 0.10        # damping: less turn per rad/s the robot is already turning
-K_INT       = 0.30        # integral: the turn grows this much (fraction of speed) per rad x s of heading error.
+K_INT       = 0.15        # integral: the turn grows this much (fraction of speed) per rad x s of heading error.
                           # A 4-wheel skid-steer robot doesn't turn at all for a small left/right difference
                           # (the tyres just scrub): real run 2026-10-08 drifted 4 cm with a 40-PWM difference
                           # applied for a second. The integral keeps adding until it turns, then unwinds.
 INT_MAX     = 0.35        # ... but never more than this (fraction of speed)
+INT_MIN_SPEED = 3.0       # ... and it only grows while the robot really moves along the lane (cm/s): blocked (real run
+                          # 2026-11-03: bot 2 caught on a tile joint for 2.4 s) it wound up to the limit and, once free,
+                          # swung the robot 45 deg out of the lane
 STEER_MIN   = 30          # friction compensation: any real steering demand gets at least this left/right PWM
                           # difference on top (jumps past the scrub dead zone instead of waiting for the integral).
                           # Tuned 2026-10-08 (tools/tune_lane.py + tune_lane_robust.py, simulator with skid-steer
@@ -55,7 +64,9 @@ STEER_MIN   = 30          # friction compensation: any real steering demand gets
 STEER_DEAD  = 2           # ... demands smaller than this (PWM) count as "go straight"
 INT_LEARN   = 0.3         # what's left at the end of a straight = motor imbalance: the next straight in the same
                           # direction (forward / reverse) starts with this much of it
-OFF_LANE_CM = 6           # further than this from the centre line -> stop (something is wrong)
+OFF_LANE_CM = 6           # further than this from the centre line -> stop (something is wrong) - except right
+MAX_REPLANS = 2           # after a turn inside a junction square: plan again from there, at most this often per goal
+PREDICT_S   = 0.0         # on a straight, steer from the pose this far ahead (s): the delay from command to camera
 LATENCY_S   = 0.15        # camera + Wi-Fi delay: stops and turns are ended this much early (a first
                           # guess - it is raised automatically whenever a turn overshoots)
 PICK_SIDE   = "front"     # where the pick mechanism is: "front" (2026-10-30: bot 1's claw is at its front - it
@@ -148,6 +159,12 @@ def make_pieces(points, start_heading, final_heading=None):
     return pieces
 
 
+def in_junction(pt, r=9.0):
+    """Inside a junction's 20 x 20 cm square (within r cm of its centre on both axes)?"""
+    return any(v["kind"] == "junction" and abs(pt[0] - v["xy"][0]) <= r and abs(pt[1] - v["xy"][1]) <= r
+               for v in spec.NODES.values())
+
+
 def roomy(pt):
     """Is there room to turn on the spot here? Only at a junction or a bay mouth."""
     return any(v["kind"] in ("junction", "mouth") and math.hypot(pt[0] - v["xy"][0], pt[1] - v["xy"][1]) < 3
@@ -181,10 +198,13 @@ class Follower:
         self.turn_gain, self.move_gain = 1.0, 1.0   # learned: pulse length corrections
         self.hist = []                      # recent poses, to tell when the robot is really still
         self.carrying = False               # set by the run loop: a cube is held on the PICK side
+        self.align_deg = ALIGN_DEG          # a turn is done within this (the run loop tightens it to line up a pick)
         self.integ = 0.0                    # steering integral (fraction of speed), this straight
         self.imbalance = {False: 0.0, True: 0.0}   # learned: steering a straight needs (forward / reverse)
         self.integ_piece = None             # which piece the integral belongs to
         self._dt = 0.0
+        self.replans, self.shift = 0, (0.0, 0.0)
+        self.route_nodes, self.route_seg = None, 0   # a route given by the fleet planner (node names) / progress on it
         self._reset_tries()
 
     def _reset_tries(self):
@@ -192,14 +212,20 @@ class Follower:
         self.turn_started = None
 
     # ---------------------------------------------------------------- planning
-    def go(self, x, y, heading_deg, goal, shift=(0.0, 0.0)):
+    def go(self, x, y, heading_deg, goal, shift=(0.0, 0.0), _replan=False, route_nodes=None):
         """Plan a route from the robot's pose to a goal node ('S1'..'S6', 'DZ', 'P1'..'P3', or any node).
         Without cut-outs (spec.CUTOUTS = False) a bay goal means the bay's mouth on the ring.
         Tries the direct route and routes via each junction, and keeps the one with the fewest turns
         where there's no room (mid-lane, on a docking square), then the shortest.
         shift = (dx, dy) cm: stop this far from the goal node, along its lane (a docking square: level with the
-        cube in the alcove)."""
+        cube in the alcove).
+        route_nodes = drive exactly this route (node names, ending at the goal) - the fleet planner's choice, which
+        keeps clear of the other robots - instead of choosing one. Kept for re-plans on the way (junction re-plan)."""
         goal = spec.goal_node(goal)
+        if not _replan:                                 # (the same route again: keep the place on it)
+            same = route_nodes is not None and self.route_nodes == list(route_nodes)
+            self.route_nodes = list(route_nodes) if route_nodes else None
+            self.route_seg = self.route_seg if same else 0
         (_, _), off = spec.project_to_lane(x, y)
         if goal not in spec.NODES:
             self.state = "NO ROUTE"
@@ -211,8 +237,9 @@ class Follower:
         self.final_heading = (math.radians(spec.heading_for_pick(goal, PICK_SIDE))
                               if goal in spec.STATIONS else None)
         best = None
-        for via in [None] + [n for n, v in spec.NODES.items() if v["kind"] == "junction"]:
-            pts = self._plan_points(x, y, goal, via)
+        vias = ([None] + [n for n, v in spec.NODES.items() if v["kind"] == "junction"]) if not self.route_nodes else ["fixed"]
+        for via in vias:
+            pts = self._fixed_points(x, y) if via == "fixed" else self._plan_points(x, y, goal, via)
             if pts is None:
                 continue
             if shift[0] or shift[1]:                               # stop a little way along the goal's lane
@@ -230,10 +257,34 @@ class Follower:
         if best is None:
             self.state = "NO ROUTE"
             return False
-        self.pieces, self.i, self.goal = best[1], 0, goal
+        self.pieces, self.i, self.goal, self.shift = best[1], 0, goal, shift
+        if not _replan:
+            self.replans = 0
         self._reset_tries()
         self.state = "TURN" if self.pieces else "FINAL TURN"
         return True
+
+    def _fixed_points(self, x, y):
+        """The rest of the given route from where the robot is: the route segment it is on (never one before the last
+        one used), then the nodes after it."""
+        (px, py), _ = spec.project_to_lane(x, y)
+        nodes = self.route_nodes
+        if len(nodes) == 1:
+            return [(px, py), spec.NODES[nodes[0]]["xy"]]
+        best = None
+        for i in range(self.route_seg, len(nodes) - 1):
+            (ax, ay), (bx, by) = spec.NODES[nodes[i]]["xy"], spec.NODES[nodes[i + 1]]["xy"]
+            dx, dy = bx - ax, by - ay
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / max(dx * dx + dy * dy, 1e-9)))
+            d = math.hypot(ax + t * dx - px, ay + t * dy - py)
+            if best is None or d < best[0] - 0.5:
+                best = (d, i, t)
+        _, i, t = best
+        self.route_seg = i
+        rest = [spec.NODES[n]["xy"] for n in nodes[i + 1:]]
+        if math.hypot(rest[0][0] - px, rest[0][1] - py) < 0.5:
+            return rest
+        return [(px, py)] + rest
 
     @staticmethod
     def _plan_points(x, y, goal, via):
@@ -272,8 +323,8 @@ class Follower:
         return 0, 0, self.state
 
     def _still(self, t):
-        """No movement over the last 0.25 s (compares poses, so camera noise doesn't fool it)."""
-        old = [p for p in self.hist if p[0] <= t - 0.25]
+        """No movement over the last STILL_S (compares poses, so camera noise doesn't fool it)."""
+        old = [p for p in self.hist if p[0] <= t - STILL_S]
         if not old:
             return False
         _, x0, y0, h0 = old[-1]
@@ -294,7 +345,7 @@ class Follower:
             self.pulse_until = None
             self.tries += 1
             return self._wait(t, self.state)
-        tol = math.radians(ALIGN_DEG if self.tries < MAX_TRIES else 2 * ALIGN_DEG)
+        tol = math.radians(self.align_deg if self.tries < MAX_TRIES else 2 * self.align_deg)
         if abs(err) <= tol:
             self._reset_tries()
             self.state = then
@@ -391,6 +442,12 @@ class Follower:
 
         # DRIVE
         if abs(cross) > OFF_LANE_CM:
+            if along < 8 and self.replans < MAX_REPLANS and in_junction((x, y)):
+                # just turned in a junction square but its turning point slid off the new line (real run 2026-11-03:
+                # bot 2 carrying a cube, 6.2 cm): there is room here - plan again from where it is (a short shuffle)
+                self.replans += 1
+                if self.go(x, y, heading_deg, self.goal, shift=self.shift, _replan=True):
+                    return 0, 0, self.state
             self.state = "OFF LANE"
             return 0, 0, self.state
         if left_to_go <= STOP_CM + (abs(self.v_est) * self.stop_lat if p.stop else 0):
@@ -398,6 +455,10 @@ class Follower:
                 return self._wait(t, "NUDGE")
             return self._next_piece(t)
         travel = wrap(h + (math.pi if p.reverse else 0))           # direction the robot is moving
+        if PREDICT_S:                                              # steer from where it will be when this command acts
+            v_travel = self.v_est * (-1 if p.reverse else 1)       # (cm/s along the way it moves)
+            cross += v_travel * math.sin(wrap(travel - p.dir)) * PREDICT_S
+            travel = wrap(travel + self.w_est * PREDICT_S)
         target = 0.0
         if self.carrying and PICK_SIDE != "front":                 # robot + cube centred: shift away from the cube
             away_left = (PICK_SIDE == "right") != p.reverse        # (the robot's left is the travel-left going fwd)
@@ -407,17 +468,22 @@ class Follower:
         want = wrap(p.dir - approach)                              # steer back toward the centre line
         err = wrap(want - travel)
         if abs(err) > math.radians(REALIGN_DEG):
+            self.integ_piece = None                                # (after the turn: start from the learnt imbalance)
             return self._wait(t, "TURN")
         v = BASE_PWM
         if p.stop:
             v = max(MIN_PWM, BASE_PWM * min(1.0, left_to_go / SLOW_CM))
         if self.integ_piece is not p:                              # a new straight: start from what straights
             self.integ_piece, self.integ = p, self.imbalance[p.reverse]   # this way needed before
-        self.integ = max(-INT_MAX, min(INT_MAX, self.integ + K_INT * err * self._dt))
-        self.imbalance[p.reverse] += INT_LEARN * self._dt * (self.integ - self.imbalance[p.reverse])
+        moving = self.v_est * (-1 if p.reverse else 1) > INT_MIN_SPEED   # along the piece - not blocked / starting
+        if moving:
+            self.integ = max(-INT_MAX, min(INT_MAX, self.integ + K_INT * err * self._dt))
+            self.imbalance[p.reverse] += INT_LEARN * self._dt * (self.integ - self.imbalance[p.reverse])
         turn = (K_HEAD * err - K_RATE * self.w_est + self.integ) * v   # + = counter-clockwise
         if STEER_MIN and abs(turn) > STEER_DEAD:
             turn += math.copysign(STEER_MIN / 2, turn)             # (each side gets half the difference)
+        if not moving:                                             # a blocked robot steered only pivots about what
+            turn = 0.0                                             # holds it (real run: 45 deg out of the lane)
         left, right = v - turn, v + turn
         if p.reverse:                                              # backwards: same turn, wheels mirrored
             left, right = -right, -left
@@ -443,12 +509,16 @@ class Follower:
 
 # ---------------------------------------------------------------- self-test (no hardware)
 def simulate(start, heading, goals, robot=(13.0, 14.5), seed=1, verbose=True, noise_cm=0.3, lag=4,
-             ramp=1200, ramp_start=0, scrub=0.0, imbalance=1.0, head_bias_deg=0.0):
+             ramp=1200, ramp_start=0, scrub=0.0, imbalance=1.0, head_bias_deg=0.0, wheel_k=0.30, turn_gain=1.0):
     """Drive a simulated robot (lag, noise, wheel slip, the firmware's speed-up ramp) through goals.
     robot = (length, width) cm. ramp = firmware RAMP_PWM_PER_S (None = instant); ramp_start = PWM the
     ramp starts from (0 = from standstill, as robot_main.ino does now).
     scrub = cm/s of left/right wheel-speed difference that doesn't turn the body at all (skid steer: the
-    tyres scrub sideways); imbalance = left wheels' speed factor; head_bias_deg = constant heading misread.
+    tyres scrub sideways); imbalance = left wheels' speed factor; head_bias_deg = constant heading misread;
+    wheel_k = cm/s per PWM above the 70 dead band (0.30: ~27 cm/s at 160; bot 2 on 2026-11-03 drove 18 cm/s = 0.20);
+    turn_gain = how much of the left/right speed difference turns the body (skid steer: bot 2 measured 2026-11-03 from
+    1000 frames of a real run: ~0.2 deg/s per PWM of difference, 0.13 s after the command = wheel_k 0.20, scrub 3,
+    turn_gain 0.26).
     Returns dict(worst keep-out depth cm, failed legs, worst stop error cm, lateral rms / p95 cm while driving
     straight, keep-out time fraction)."""
     import random
@@ -467,8 +537,8 @@ def simulate(start, heading, goals, robot=(13.0, 14.5), seed=1, verbose=True, no
             cur = math.copysign(min(abs(target), ramp_start), target)
         return cur + max(-up, min(up, target - cur))
 
-    def wheel(pwm):                                                # ~55 cm/s at 255, stalls below ~80
-        return 0.0 if abs(pwm) < 80 else math.copysign((abs(pwm) - 70) * 0.30, pwm)
+    def wheel(pwm):                                                # ~55 cm/s at 255 (wheel_k 0.30), stalls below ~80
+        return 0.0 if abs(pwm) < 80 else math.copysign((abs(pwm) - 70) * wheel_k, pwm)
 
     L, W = robot
     corners = [(L / 2, W / 2), (L / 2, -W / 2), (-L / 2, W / 2), (-L / 2, -W / 2)]
@@ -491,7 +561,7 @@ def simulate(start, heading, goals, robot=(13.0, 14.5), seed=1, verbose=True, no
             vl, vr = wheel(l) * rnd.gauss(1, 0.03) * imbalance, wheel(r) * rnd.gauss(1, 0.03)
             dv = vr - vl
             dv = math.copysign(max(0.0, abs(dv) - scrub), dv)       # skid steer: small differences just scrub
-            h += dv / TRACK * DT                                   # counter-clockwise positive
+            h += dv * turn_gain / TRACK * DT                       # counter-clockwise positive
             x += (vl + vr) / 2 * DT * math.cos(h)
             y += (vl + vr) / 2 * DT * math.sin(h)
             t += DT

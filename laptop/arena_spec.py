@@ -205,12 +205,23 @@ def nearest_node(x, y, lane_only=True):
     return best[1]
 
 
+def bay_inner_end(name):
+    """The far end of a bay's axis (cm): its point, carried on to the bay's back wall. A robot parked deeper than the
+    point (2026-11-03: bot 2 left at y 40.7 in P3, whose point is at 35) is still on the bay's axis."""
+    b = BAYS[name]
+    (mx, my), (px, py) = b["mouth"], b["point"]
+    x0, y0, x1, y1 = b["rect"]
+    if mx == px:
+        return px, (y1 if py > my else y0)
+    return (x1 if px > mx else x0), py
+
+
 def project_to_lane(x, y):
-    """Closest point (cm) on any lane centre line or bay axis, and the distance to it."""
+    """Closest point (cm) on any lane centre line or bay axis (to the bay's back wall), and the distance to it."""
     best = None
     segs = [((lx, 10), (lx, 290)) for lx in LANE_X] + [((10, ly), (290, ly)) for ly in LANE_Y]
     if CUTOUTS:
-        segs += [(b["mouth"], b["point"]) for b in BAYS.values()]
+        segs += [(b["mouth"], bay_inner_end(n)) for n, b in BAYS.items()]
     for (ax, ay), (bx, by) in segs:
         dx, dy = bx - ax, by - ay
         t = max(0.0, min(1.0, ((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)))
@@ -231,6 +242,14 @@ def route_from_point(x, y, goal):
     then the node positions along the shortest route. None if the goal can't be reached."""
     (px, py), _ = project_to_lane(x, y)
     best = None
+    for n, b in (BAYS.items() if CUTOUTS else ()):          # deeper in a bay than its point: out via the point
+        (mx, my), (bx, by) = b["mouth"], b["point"]
+        if bay_of(px, py) == n and math.hypot(px - mx, py - my) > math.hypot(bx - mx, by - my):
+            r = route(n, goal)
+            if r is None:
+                return None
+            pts = [(px, py)] + [NODES[m]["xy"] for m in r]
+            return (pts[1:] if math.hypot(bx - px, by - py) < 0.5 else pts), r
     for a, nb in EDGES.items():
         for b in nb:
             if a > b:                                      # each edge once

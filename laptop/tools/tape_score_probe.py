@@ -27,7 +27,7 @@ def tape_score(frame, corners, grow=1):
     return float(np.mean(v < 0.55 * np.median(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))))
 
 if __name__ == "__main__":
-    calib = json.load(open(ad.CALIB_FILE)); ref = np.array(calib["corners_px"])
+    calib = ad.load_calib(); ref = np.array(calib["corners_px"])
     cap = ad.open_camera(0)
     for _ in range(15): cap.read()
     ok, f = cap.read(); cap.release()

@@ -67,6 +67,7 @@ const float HEAD_K   = 1.5;   // straightness: corrects the left/right travel di
 const float HEAD_MAX = 0.25;  // max straightness correction, fraction of speed
 const float MIN_SYNC_RATE = 40;    // counts/s: below this the wheels are "not moving"
 const float RAMP_PWM_PER_S = 1200; // speed-up rate (stopping is instant)
+const float RATE_TAU_S = 0.039;    // wheel-speed filter time constant (the same smoothing as before at 50 Hz)
 
 // ---- fail-safes
 const unsigned long UDP_FAILSAFE_MS  = 300;   // laptop stopped sending -> stop
@@ -78,7 +79,7 @@ const unsigned long HTTP_FAILSAFE_MS = 1000;  // web page stopped sending -> sto
 // Every servo command is held to ARM_MIN..ARM_MAX: past 60 the claw would squeeze / jam. 20 = open wide (the old
 // firmware held the claw there for days; allowed 2026-11-02 for the pick approach); below 20 hasn't been tried.
 const int SERVO_PIN = 2;
-const int ARM_MIN = 20, ARM_MAX = 60;
+const int ARM_MIN = 0, ARM_MAX = 60;    // 0 (was 20, then 10 on 2026-11-03): bot 2's claw still opened wider at 10 - the per-robot angles in arena_calib.json keep each claw in its own range
 int ARM_STOW = 30, ARM_CARRY = 58, ARM_RELEASE = 30, ARM_REACH = 30;   // reach = open, ready to pick
 
 // ---- battery: VBAT -100k- D34 -47k- GND
@@ -111,6 +112,8 @@ unsigned long testUntil = 0;          // ... and until when (then everything sto
 unsigned long lastCmdMs = 0, failsafeMs = HTTP_FAILSAFE_MS;
 uint16_t lastSeq = 0;
 unsigned long lastUdpDriveMs = 0;
+unsigned long loopsPerSec = 0;        // loop() passes in the last second (diagnostic)
+bool driveNew = false;                // a new drive packet arrived: run the control step now, not at the next tick
 
 float battV = 0;  bool battPresent = false;  bool lowBatt = false;  float lowT = 0;
 int   servoNow = 0, servoTarget = 0;
@@ -188,7 +191,7 @@ float approach(float cur, float target, float maxUp) {
   return target;
 }
 
-// ============================ CONTROL LOOP (50 Hz) ===================
+// ============================ CONTROL LOOP (50 Hz + on every new drive packet) ===
 void syncGroup(const int* idx, int n, const float* base, float* corr, float dt) {
   // robust average speed: ignore wheels reading far below the fastest one
   // (a dead / unplugged encoder must not drag the average down)
@@ -243,7 +246,7 @@ void controlStep(float dt) {
     long c = readCount(i);
     long d = c - prevCount[i];
     prevCount[i] = c;
-    rateSigned[i] = 0.6 * rateSigned[i] + 0.4 * (d / dt);
+    rateSigned[i] += (1.0f - expf(-dt / RATE_TAU_S)) * (d / dt - rateSigned[i]);   // (steps are 4-20 ms apart)
     rateAbs[i] = fabs(rateSigned[i]);
     segDist[i] += labs(d);
   }
@@ -330,11 +333,13 @@ void servoOff() {                                       // no more pulses: the s
   servoLive = false;
 }
 
-void updateServo() {                                    // 1 degree every 8 ms
-  static unsigned long t = 0;
-  if (!servoLive || servoNow == servoTarget || millis() - t < 8) return;
-  t = millis();
-  servoNow += (servoTarget > servoNow) ? 1 : -1;
+void updateServo() {                                    // 1 degree per 8 ms of TIME (125 deg/s), however slow loop() is
+  static unsigned long t = 0;                           // (it was 1 degree per loop() pass: bot 1 took 1.5 s for 38 deg,
+  if (!servoLive || servoNow == servoTarget) { t = millis(); return; }   // so a pick closed only while backing out)
+  int steps = (millis() - t) / 8;
+  if (steps <= 0) return;
+  t += steps * 8;
+  servoNow += constrain(servoTarget - servoNow, -steps, steps);
   servoWriteAngle(servoNow);
 }
 
@@ -402,7 +407,7 @@ void updateBattery(float dt) {
 String statusJson() {
   String j = "{\"batt\":" + String(battV, 2) + ",\"low\":" + String(lowBatt) +
              ",\"servo\":" + String(servoNow) + ",\"servo_on\":" + String(servoLive) +
-             ",\"assist\":" + String(ASSIST) +
+             ",\"assist\":" + String(ASSIST) + ",\"lps\":" + String(loopsPerSec) +
              ",\"cmd\":[" + String(cmdL) + "," + String(cmdR) + "]" +
              ",\"rssi\":" + String(WiFi.RSSI());
   j += ",\"pwm\":[";  for (int i = 0; i < 4; i++) j += String(pwmOut[i]) + (i < 3 ? "," : "]");
@@ -500,6 +505,7 @@ void handleUdp() {
       lastSeq = seq;
       lastUdpDriveMs = millis();
       setCommand(l, r, UDP_FAILSAFE_MS);
+      driveNew = true;
     } else if (len > 0) {
       buf[len] = 0;
       handleText(String((char*)buf));
@@ -716,6 +722,9 @@ void setup() {
 
 void loop() {
   lastLoopMs = millis();                                // heartbeat for the motor watchdog
+  static unsigned long lpsT = millis(), lpsN = 0;       // loop() passes per second (status "lps")
+  lpsN++;
+  if (millis() - lpsT >= 1000) { loopsPerSec = lpsN; lpsN = 0; lpsT = millis(); }
   if (wdStopped) {                                      // loop() had stalled and the watchdog cut the
     wdStopped = false;                                  // motors: don't jump back to an old command,
     stopNow();                                          // wait for a fresh one
@@ -729,10 +738,14 @@ void loop() {
   handleUdp();
   server.handleClient();
 
-  static unsigned long tCtl = millis();                 // motor control at 50 Hz
-  if (millis() - tCtl >= 20) {
-    float dt = fminf((millis() - tCtl) / 1000.0f, 0.05f);   // (after a stall: no jump in the ramp)
-    tCtl = millis();
+  // motor control at 50 Hz - and at once when a new drive packet came in (it used to wait for the next 20 ms
+  // tick: 10 ms on average, added to every command). At most every 4 ms, so the wheel speeds stay meaningful.
+  static unsigned long tCtl = micros();
+  unsigned long sinceCtl = micros() - tCtl;
+  if (sinceCtl >= 20000 || (driveNew && sinceCtl >= 4000)) {
+    driveNew = false;
+    float dt = fminf(sinceCtl / 1e6f, 0.05f);              // (after a stall: no jump in the ramp)
+    tCtl = micros();
     controlStep(dt);
   }
 
